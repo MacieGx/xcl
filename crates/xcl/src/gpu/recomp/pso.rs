@@ -235,18 +235,30 @@ mod translated {
         h | 1
     }
 
+    /// The backend whose identity tags `stage`'s entries: the huge-program route only ever
+    /// changes compute entries, so vertex / pixel entries keep the plain HLSL identity and
+    /// are not re-keyed by a bump of the direct translator's version.
+    pub(super) fn backend_for(backend: Backend, stage: Stage) -> Backend {
+        match backend {
+            Backend::HlslHugeDirect(_) if stage != Stage::Compute => Backend::Hlsl,
+            b => b,
+        }
+    }
+
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
-        static I: OnceLock<u64> = OnceLock::new();
-        *I.get_or_init(|| {
+    fn identity(stage: Stage) -> u64 {
+        static COMPUTE: OnceLock<u64> = OnceLock::new();
+        static OTHER: OnceLock<u64> = OnceLock::new();
+        let cell = if stage == Stage::Compute { &COMPUTE } else { &OTHER };
+        *cell.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
-                Backend::current(),
+                backend_for(Backend::current(), stage),
                 crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
             )
         })
@@ -343,7 +355,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
+        cached_in(dir, identity(stage), blob, stage, sampler_base, windows, split, translate)
     }
 }
 
@@ -1040,6 +1052,19 @@ mod shader_cache_tests {
         assert_eq!(huge_direct_min_from(Some("0")), None);
         assert_eq!(huge_direct_min_from(Some(" 200 ")), Some(200 << 10));
         assert_eq!(huge_direct_min_from(Some("junk")), Some(HUGE_DIRECT_MIN_DEFAULT));
+    }
+
+    #[test]
+    fn huge_route_tags_compute_entries_only() {
+        use translated::{backend_for, identity_with, Backend};
+        let huge = Backend::HlslHugeDirect(64 << 10);
+        assert_eq!(backend_for(huge, Stage::Compute), huge);
+        for stage in [Stage::Vertex, Stage::Pixel] {
+            assert_eq!(backend_for(huge, stage), Backend::Hlsl);
+            // a direct translator version bump leaves these entries' identity alone
+            assert_eq!(identity_with("s", "t", backend_for(huge, stage), 1), identity_with("s", "t", backend_for(huge, stage), 2));
+        }
+        assert_eq!(backend_for(Backend::DirectAll, Stage::Pixel), Backend::DirectAll);
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
