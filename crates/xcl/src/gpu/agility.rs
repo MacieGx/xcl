@@ -321,6 +321,8 @@ where
     P: Param<IUnknown>,
 {
     let mut device: Option<ID3D12Device> = None;
+    // LOCAL TEST: XCL_LOCAL_CODE_HEAP_MB (driver 621.24's code heap reservation)
+    super::local_code_heap::install();
     match state() {
         State::Loaded { factory, .. } => {
             // SAFETY: `factory` is a valid `ID3D12DeviceFactory` kept alive for `'static`,

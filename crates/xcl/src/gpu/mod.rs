@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod agility;
+pub mod local_code_heap;
 pub mod bvh;
 pub mod desc;
 pub mod dxbc;
