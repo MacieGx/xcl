@@ -44,9 +44,10 @@ uint clamp_args(inout uint3 a) {
         a.y = min(a.y, MAX_VERTEX_INSTANCES / max(a.x, 1u));
         return a.x * a.y;
     }
-    // a 1-D dispatch of more groups than D3D12 takes in a dimension, as whole rows
-    if (fold != 0 && a.x > MAX_GROUPS_DIM && a.y == 1 && a.z == 1 && a.x % fold == 0) {
-        a.y = a.x / fold;
+    // a 1-D dispatch of more groups than D3D12 takes in a dimension, as whole rows (the last
+    // row runs up to fold - 1 groups more than were asked for)
+    if (fold != 0 && a.x > MAX_GROUPS_DIM && a.y == 1 && a.z == 1) {
+        a.y = (a.x + fold - 1) / fold;
         a.x = fold;
     }
     a = min(a, uint3(MAX_GROUPS_DIM, MAX_GROUPS_DIM, MAX_GROUPS_DIM));

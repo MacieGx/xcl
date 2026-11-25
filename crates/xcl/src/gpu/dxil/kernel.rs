@@ -49,9 +49,10 @@ pub const WINDOW_NO_CARRY: u32 = 0x400;
 /// 1-D dispatch of more groups than D3D12 takes in a dimension (65535) runs as rows
 /// (`XCL_FOLD_GROUPS`, `indirect_clamp`). The idea of running the surplus as rows is VIctory's
 /// (GPL-3.0; no code taken).
-pub const FOLD_GROUPS: u32 = 0x800;
-/// groups in a row of a folded dispatch (a 2560x1440 list of 32-pixel groups is 3 rows)
-pub const FOLD_ROW: u32 = 38400;
+pub const FOLD_GROUPS: u32 = 0x1000;
+/// groups in a row of a folded dispatch. The last row is whole too: up to `FOLD_ROW` - 1 groups
+/// past the ones the title asked for run as well (the program is not told how many were asked)
+pub const FOLD_ROW: u32 = 1024;
 
 /// Lab (`XCL_FOLD_GROUPS=<cs record hash>,...`): the compute programs whose group id is folded.
 pub fn fold_groups(record: u64) -> bool {
