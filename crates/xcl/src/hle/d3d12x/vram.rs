@@ -507,10 +507,10 @@ const SCRUB_TILES: usize = 256;
 struct Scrub {
     over: ID3D12Resource,
     zeros: ID3D12Resource,
-    alloc: ID3D12CommandAllocator,
-    list: ID3D12GraphicsCommandList,
-    /// `Pages::value` after the last copy (the allocator is reset once the fence is there)
-    busy: u64,
+    /// (allocator, list, `Pages::value` after its last copy): one is used again once the fence
+    /// is there – never waited for (the mapping queue may itself be waiting for the title's
+    /// work, which waits for the pages lock this runs under: runs stood still that way)
+    lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>,
 }
 
 /// lab: `XCL_ZERO_TARGET_PAGES=1` – pool tiles given to a render target, depth buffer or UAV
@@ -597,11 +597,8 @@ impl Pages {
                     None,
                     &mut zeros,
                 )?;
-                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
-                list.Close()?;
                 let (Some(over), Some(zeros)) = (over, zeros) else { return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)) };
-                Ok(Scrub { over, zeros, alloc, list, busy: 0 })
+                Ok(Scrub { over, zeros, lists: Vec::new() })
             });
             match made {
                 Ok(s) => self.scrub = Some(s),
@@ -617,11 +614,25 @@ impl Pages {
         let mut sorted: Vec<Tile> = tiles.to_vec();
         sorted.sort_unstable();
         for chunk in sorted.chunks(SCRUB_TILES) {
+            // a list whose last copy has run, or a new one
+            let done = self.fence.GetCompletedValue();
+            let Some(sc) = self.scrub.as_mut() else { return };
+            let k = match sc.lists.iter().position(|l| l.2 <= done) {
+                Some(k) => k,
+                None => {
+                    let made = super::title_textures::own_work(|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)> {
+                        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+                        list.Close()?;
+                        Ok((alloc, list, 0))
+                    });
+                    let Ok(l) = made else { return };
+                    sc.lists.push(l);
+                    sc.lists.len() - 1
+                }
+            };
             let Some(sc) = self.scrub.as_ref() else { return };
-            // the copy before this one has run (its allocator is used again)
-            if sc.busy != 0 && self.fence.GetCompletedValue() < sc.busy {
-                let _ = self.fence.SetEventOnCompletion(sc.busy, windows::Win32::Foundation::HANDLE::default());
-            }
+            let (alloc, list) = (&sc.lists[k].0, &sc.lists[k].1);
             // tile i of the buffer over `chunk[i]`: one call per pool heap
             let mut at = 0usize;
             while at < chunk.len() {
@@ -654,21 +665,21 @@ impl Pages {
                 );
                 at += n;
             }
-            if sc.alloc.Reset().is_err() || sc.list.Reset(&sc.alloc, None).is_err() {
+            if alloc.Reset().is_err() || list.Reset(alloc, None).is_err() {
                 return;
             }
-            sc.list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64);
-            if sc.list.Close().is_err() {
+            list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64);
+            if list.Close().is_err() {
                 return;
             }
-            let Ok(cl) = sc.list.cast::<ID3D12CommandList>() else { return };
+            let Ok(cl) = list.cast::<ID3D12CommandList>() else { return };
             // (XCL's own work: the queue hook must not take it for the title's and refresh)
             super::title_textures::own_work(|| self.queue.ExecuteCommandLists(&[Some(cl)]));
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
             let busy = self.value;
             if let Some(sc) = self.scrub.as_mut() {
-                sc.busy = busy;
+                sc.lists[k].2 = busy;
             }
             let n = SCRUBBED.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed) + chunk.len() as u64;
             if n == chunk.len() as u64 {
