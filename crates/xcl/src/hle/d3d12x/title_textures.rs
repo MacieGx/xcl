@@ -1071,6 +1071,189 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+/// `XCL_WATCH_HOT=0`: every look before a submit walks all the watched memory, as before.
+/// Otherwise a look takes the 2 MiB blocks written in the last few seconds only, and a thread of
+/// its own walks the rest in small steps and makes a block hot when it finds a written page there
+/// (within ~10 ms; its pages stay reported until a look takes them). A look over 8 GiB of
+/// committed memory took 4.3-4.9 ms however few pages were written, on one thread or split over
+/// sixteen (measured, Windows 11 26300); 64 looks of 2 MiB took 0.2 ms. A retail title's world
+/// made ~66 submits a frame on one thread, each behind a 7 ms look over ~11 GiB.
+fn hot_looks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WATCH_HOT").map_or(true, |v| v.trim() != "0"))
+}
+
+const HOT_BLOCK: usize = 2 << 20;
+/// a block nothing was written to for this long is left to the walk again
+const HOT_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Default)]
+struct HotBlocks {
+    /// block -> when a look or the walk last found a written page in it
+    hot: BTreeMap<usize, std::time::Instant>,
+    /// the ranges `known` was made for
+    ranges: Option<Arc<Vec<(usize, usize)>>>,
+    /// the blocks of those ranges (a block new to the ranges starts hot)
+    known: std::collections::HashSet<usize>,
+}
+
+static HOT: Mutex<Option<HotBlocks>> = Mutex::new(None);
+/// the ranges of the last look, for the walk
+static WALK_RANGES: Mutex<Option<Arc<Vec<(usize, usize)>>>> = Mutex::new(None);
+/// looks, runs they took, bytes they covered, blocks the walk made hot
+static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The written pages of the hot blocks inside `ranges` (see `hot_looks`).
+unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
+    start_walk(ranges);
+    let now = std::time::Instant::now();
+    let (runs, hot_now): (Vec<(usize, usize)>, usize) = {
+        let mut g = HOT.lock().unwrap();
+        let h = g.get_or_insert_with(HotBlocks::default);
+        // a block new to the ranges starts hot: memory just mapped is often written and used at once
+        if !h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+            let mut known = std::collections::HashSet::with_capacity(h.known.len());
+            for &(base, size) in ranges.iter() {
+                let mut b = base & !(HOT_BLOCK - 1);
+                while b < base + size {
+                    if !h.known.contains(&b) {
+                        h.hot.insert(b, now);
+                    }
+                    known.insert(b);
+                    b += HOT_BLOCK;
+                }
+            }
+            h.known = known;
+            h.ranges = Some(Arc::clone(ranges));
+        }
+        h.hot.retain(|_, t| now.duration_since(*t) < HOT_FOR);
+        // the hot blocks as runs, each inside one range (a write-watch call covers one allocation)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (&b, _) in h.hot.iter() {
+            let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
+            while let Some(&(base, size)) = ranges.get(j) {
+                if base >= b + HOT_BLOCK {
+                    break;
+                }
+                let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
+                if lo < hi {
+                    match runs.last_mut() {
+                        Some(last) if last.0 + last.1 == lo && lo > base => last.1 += hi - lo,
+                        _ => runs.push((lo, hi - lo)),
+                    }
+                }
+                j += 1;
+            }
+        }
+        (runs, h.hot.len())
+    };
+    let first = dirty.len();
+    for &(base, size) in &runs {
+        take_written(base, size, buf, dirty, page);
+    }
+    if dirty.len() > first {
+        let mut g = HOT.lock().unwrap();
+        if let Some(h) = g.as_mut() {
+            let mut last = usize::MAX;
+            for &p in &dirty[first..] {
+                let b = p & !(HOT_BLOCK - 1);
+                if b != last {
+                    h.hot.insert(b, now);
+                    last = b;
+                }
+            }
+        }
+    }
+    let n = HOT_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let r = HOT_STATS[1].fetch_add(runs.len() as u64, Ordering::Relaxed) + runs.len() as u64;
+    let covered: usize = runs.iter().map(|r| r.1).sum();
+    let bytes = HOT_STATS[2].fetch_add(covered as u64, Ordering::Relaxed) + covered as u64;
+    if n.is_power_of_two() && n >= 256 {
+        let watched: usize = ranges.iter().map(|r| r.1).sum();
+        crate::xlog_info!(
+            "D3D12.X: looks for CPU writes: {n} so far, {} runs and {} MB a look on average ({} MB watched in {} ranges); {hot_now} blocks hot now, {} made hot by the walk",
+            r / n,
+            (bytes / n) >> 20,
+            watched >> 20,
+            ranges.len(),
+            HOT_STATS[3].load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn start_walk(ranges: &Arc<Vec<(usize, usize)>>) {
+    {
+        let mut g = WALK_RANGES.lock().unwrap();
+        if !g.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+            *g = Some(Arc::clone(ranges));
+        }
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-watch-walk".into()).spawn(|| unsafe { walk() });
+        crate::xlog_info!(
+            "D3D12.X: a look for CPU writes takes the blocks written in the last {} s; a thread walks the rest (XCL_WATCH_HOT=0: every look walks everything)",
+            HOT_FOR.as_secs()
+        );
+    });
+}
+
+/// The walk: all watched memory in steps of 64 MiB, without taking the written pages (they stay
+/// reported until a look takes them); a block with a written page is hot from then on.
+unsafe fn walk() {
+    const STEP: usize = 64 << 20;
+    let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8192];
+    let mut found: Vec<usize> = Vec::new();
+    loop {
+        let ranges = WALK_RANGES.lock().unwrap().clone();
+        let Some(ranges) = ranges else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        };
+        for &(base, size) in ranges.iter() {
+            let end = base + size;
+            let mut at = base;
+            while at < end {
+                let stop = (at + STEP).min(end);
+                let mut from = at;
+                while from < stop {
+                    let (mut n, mut page) = (buf.len(), 0u32);
+                    if GetWriteWatch(0, from as *const c_void, stop - from, buf.as_mut_ptr(), &mut n, &mut page) != 0 || n == 0 {
+                        break;
+                    }
+                    let mut last = usize::MAX;
+                    for &p in &buf[..n] {
+                        let b = p as usize & !(HOT_BLOCK - 1);
+                        if b != last {
+                            found.push(b);
+                            last = b;
+                        }
+                    }
+                    if n < buf.len() {
+                        break;
+                    }
+                    // go on after the block of the last page reported
+                    from = (buf[n - 1] as usize & !(HOT_BLOCK - 1)) + HOT_BLOCK;
+                }
+                if !found.is_empty() {
+                    let now = std::time::Instant::now();
+                    let mut g = HOT.lock().unwrap();
+                    let h = g.get_or_insert_with(HotBlocks::default);
+                    for b in found.drain(..) {
+                        if let std::collections::btree_map::Entry::Vacant(v) = h.hot.entry(b) {
+                            v.insert(now);
+                            HOT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                at = stop;
+                std::thread::yield_now();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(300));
+    }
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -1089,8 +1272,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if hot_looks() {
+                take_hot(&ranges, &mut buf, &mut dirty, &mut page);
+            } else {
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         dirty.sort_unstable();
