@@ -2268,7 +2268,10 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
             let w0 = (slot as *const u32).read_unaligned();
             let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
             // (render targets, depth buffers and UAV textures: not the streamed ones)
-            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| { let d = x.GetDesc(); !only.is_empty() && d.Dimension.0 >= 2 || d.Flags.0 & 7 != 0 || d.Format.0 == 67 })) {
+            // (a slot may still name a texture the title released: its object must at least
+            // have a method table – a run ended in GetDesc of such a one)
+            let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+            if let Some(r) = r.filter(|&r| alive(r) && ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| { let d = x.GetDesc(); !only.is_empty() && d.Dimension.0 >= 2 || d.Flags.0 & 7 != 0 || d.Format.0 == 67 })) {
                 super::present::note_rt_dump(r, if only.is_empty() { b'u' } else { b'o' });
             }
         }
