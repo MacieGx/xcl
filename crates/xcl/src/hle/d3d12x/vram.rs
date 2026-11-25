@@ -662,7 +662,8 @@ impl Pages {
                 return;
             }
             let Ok(cl) = sc.list.cast::<ID3D12CommandList>() else { return };
-            self.queue.ExecuteCommandLists(&[Some(cl)]);
+            // (XCL's own work: the queue hook must not take it for the title's and refresh)
+            super::title_textures::own_work(|| self.queue.ExecuteCommandLists(&[Some(cl)]));
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
             let busy = self.value;
