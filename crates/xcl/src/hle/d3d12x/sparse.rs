@@ -1600,6 +1600,9 @@ impl State {
         let Some(p) = self.staging_ptr() else { return };
         let mut open_slot: Option<usize> = None;
         let mut last_wi: Option<usize> = None;
+        // the copies into the ring (source address, ring offset, bytes), done before their slot is
+        // submitted, by the worker threads when there are many
+        let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
         for &(a, n) in runs {
             let mut done = 0usize;
             while done < n {
@@ -1621,6 +1624,7 @@ impl State {
                     self.reclaim_ring();
                     if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                         if let Some(slot_idx) = open_slot.take() {
+                            run_copies(&mut jobs, p);
                             self.submit_slot(slot_idx);
                             self.reclaim_ring();
                         }
@@ -1640,7 +1644,7 @@ impl State {
                     }
                 };
                 let dst_off = (aligned as usize) % STAGING;
-                std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
+                jobs.push((cur, dst_off, chunk));
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
                 self.ring_write = aligned + chunk as u64;
@@ -1648,6 +1652,7 @@ impl State {
             }
         }
         if let Some(slot_idx) = open_slot {
+            run_copies(&mut jobs, p);
             self.submit_slot(slot_idx);
         }
     }
@@ -2192,6 +2197,91 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
 }
 
+/// One page to scan: its address and the slot of its hashes (disjoint for every page of one
+/// submit: the pages are distinct and their tiles' entries are only touched through these).
+struct PageSlot {
+    pg: usize,
+    slot: *mut Option<Box<[u64; CHUNKS]>>,
+}
+
+/// The pages of one submit, shared with the worker threads (`worker_pool`).
+struct SharedPages<'a>(&'a [PageSlot]);
+// SAFETY: the slots are disjoint, and the scan finishes before the state's lock is given up
+unsafe impl Sync for SharedPages<'_> {}
+
+/// Scan `pages` (`scan_page` on each); the changed runs go to `out` in address order.
+unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) {
+    /// pages a worker takes at a time, and the number from which the work is shared
+    const PIECE: usize = 64;
+    const SHARE_FROM: usize = 256;
+    let scan = |p: &PageSlot, out: &mut Vec<(usize, usize)>| {
+        let bytes = std::slice::from_raw_parts(p.pg as *const u8, PAGE);
+        scan_page(bytes, p.pg, &mut *p.slot, out);
+    };
+    if pages.len() < SHARE_FROM {
+        pages.iter().for_each(|p| scan(p, out));
+        return;
+    }
+    let pieces = pages.len().div_ceil(PIECE);
+    let outs: Vec<Mutex<Vec<(usize, usize)>>> = (0..pieces).map(|_| Mutex::new(Vec::new())).collect();
+    let shared = SharedPages(pages);
+    let work = |k: usize| {
+        // (the whole struct, not its field: that is what is Sync)
+        let shared = &shared;
+        let mut mine = Vec::new();
+        for p in &shared.0[k * PIECE..((k + 1) * PIECE).min(shared.0.len())] {
+            scan(p, &mut mine);
+        }
+        *outs[k].lock().unwrap_or_else(|e| e.into_inner()) = mine;
+    };
+    super::worker_pool::run(pieces, &work);
+    for o in outs {
+        for (addr, len) in o.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            push_run(out, addr, len);
+        }
+    }
+}
+
+/// Copies from the title's memory into the staging ring: shared with the worker threads when
+/// there are many bytes.
+unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
+    const SHARE_FROM: usize = 512 << 10;
+    let total: usize = jobs.iter().map(|j| j.2).sum();
+    if total < SHARE_FROM || jobs.len() < 2 {
+        for &(src, off, n) in jobs.iter() {
+            std::ptr::copy_nonoverlapping(src as *const u8, staging.add(off), n);
+        }
+    } else {
+        // pieces of about the same bytes, in the order of the jobs
+        let target = (total / 16).max(64 << 10);
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        let (mut from, mut bytes) = (0usize, 0usize);
+        for (k, j) in jobs.iter().enumerate() {
+            bytes += j.2;
+            if bytes >= target {
+                pieces.push((from, k + 1));
+                from = k + 1;
+                bytes = 0;
+            }
+        }
+        if from < jobs.len() {
+            pieces.push((from, jobs.len()));
+        }
+        struct Staging(*mut u8);
+        // SAFETY: the copies go to disjoint pieces of the ring, all from the caller's job list
+        unsafe impl Sync for Staging {}
+        let st = Staging(staging);
+        let list: &[(usize, usize, usize)] = jobs;
+        super::worker_pool::run(pieces.len(), &|k| {
+            let st = &st;
+            for &(src, off, n) in &list[pieces[k].0..pieces[k].1] {
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, st.0.add(off), n) };
+            }
+        });
+    }
+    jobs.clear();
+}
+
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings. The pages go a part at a
@@ -2247,10 +2337,13 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
     dirty_runs.clear();
     // (runs, bytes) of the parts sent before the last
     let mut sent = (0usize, 0usize);
+    let mut pages: Vec<PageSlot> = Vec::with_capacity(dirty.len());
     let mut i = 0;
     while i < dirty.len() {
         if left < page {
             // this part goes; the next has the room the ring has then
+            scan_pages(&pages, &mut dirty_runs);
+            pages.clear();
             s.upload_dirty(&dirty_runs);
             sent = (sent.0 + dirty_runs.len(), sent.1 + dirty_runs.iter().map(|r| r.1).sum::<usize>());
             dirty_runs.clear();
@@ -2279,8 +2372,7 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
                 while pg < end {
                     let idx = (pg - t) / PAGE;
                     if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                        pages.push(PageSlot { pg, slot: &mut entry.sent[idx] });
                     }
                     pg += PAGE;
                 }
@@ -2288,6 +2380,7 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
             x = end;
         }
     }
+    scan_pages(&pages, &mut dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len() + sent.0) as u64, Ordering::Relaxed);

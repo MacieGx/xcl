@@ -39,6 +39,7 @@ pub mod view_mem;
 mod submit_cost;
 pub mod title_textures;
 pub mod vram;
+mod worker_pool;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
