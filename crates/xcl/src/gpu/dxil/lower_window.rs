@@ -151,17 +151,21 @@ impl Lw {
         self.wr(VAR_WIN, w);
     }
 
-    /// `Lw::rodata` (the HLSL kernel's `xcl_gload`): the dwords `vals` a load read from memory
-    /// at `a`, `a + 4`.. (`a` dword-aligned), with those at a code address inside one of the
-    /// program's constant data blocks replaced by the block's dword. A code address has the
-    /// high dword `CODE_ADDRESS_HI` with several windows (`s_getpc_b64`; the window of the
-    /// access was just selected: `VAR_WIN`) and is the program's offset with one. `vals` as
-    /// they are without data.
-    pub(crate) fn rodata_loads(&mut self, a: Value, vals: Vec<Value>) -> Vec<Value> {
+    /// `Lw::rodata` (the HLSL kernel's `xcl_cload` / `xcl_gload`): the dwords `vals` the load
+    /// at `pc` read from memory at `a`, `a + 4`.. (`a` dword-aligned), with those at a code
+    /// address inside one of the program's constant data blocks replaced by the block's dword
+    /// (`Lw::code_loads`). A load whose address comes from `s_getpc_b64` on every path takes
+    /// the block's dwords (0 outside the blocks); one whose address may come from it tells a
+    /// code address by the high dword `CODE_ADDRESS_HI` with several windows (the window of
+    /// the access was just selected: `VAR_WIN`) and by the program's offset with one. `vals`
+    /// as they are for the other loads and without data.
+    pub(crate) fn rodata_loads(&mut self, pc: u64, a: Value, vals: Vec<Value>) -> Vec<Value> {
         let total: usize = self.rodata.iter().map(|b| b.1.len()).sum();
+        let Some(&kind) = self.code_loads.get(&pc) else { return vals };
         if total == 0 {
             return vals;
         }
+        let only_code = kind == crate::gpu::recomp::code_loads::CodeLoad::Code;
         let table = match self.rodata_table {
             Some(g) => g,
             None => {
@@ -175,7 +179,7 @@ impl Lw {
                 g
             }
         };
-        let code = if self.windowed() {
+        let code = if self.windowed() && !only_code {
             let w = self.rd(VAR_WIN);
             let base = self.uma_base();
             let hi = self.c(crate::gpu::recomp::CODE_ADDRESS_HI);
@@ -216,7 +220,7 @@ impl Lw {
                 }
                 let p = self.s.m.gep(table, &[z, idx]);
                 let t = self.s.m.load(p, 4);
-                self.sel(inside, t, v)
+                self.sel(inside, t, if only_code { z } else { v })
             })
             .collect()
     }

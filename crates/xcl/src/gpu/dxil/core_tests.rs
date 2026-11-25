@@ -431,8 +431,20 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
             // memory, not the data: v[12:13] and s[2:3]
             ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
             ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
-            // the V# s[4:7]
+            // the V# s[4:7] on the table
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 1)], None),
             ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            // s[8:9]: the code address on one path, memory on the other – told at run time
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 0)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
         ])
     };
     // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
@@ -460,6 +472,7 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
         assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
         assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
         assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        assert_eq!(r.sgpr[21..23], [table[3], 4343], "{what}: s_load of the table, then of memory, through one register pair");
         assert_eq!(r.sgpr[30..32], buffer, "{what}: s_buffer_load");
         for l in 0..64usize {
             let k = l % 6;
@@ -467,10 +480,10 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
             assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
         }
     };
-    // one window: nothing of the code is in the memory (and a V# is always memory)
+    // one window: nothing of the code is in the memory
     let mut st = runner::KernelState::default();
     st.sgpr[2] = 0x900;
-    st.sgpr[4..7].copy_from_slice(&[0x900, 0, 64]);
+    st.sgpr[6] = 64;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[10] = 4 * (l as u32 % 6);
         r[12] = 0x800 + 4 * l as u32;
@@ -480,9 +493,9 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
     for l in 0..64 {
         mem[0x200 + l] = 7000 + l as u32;
     }
-    check(&runner::run(&one, &st, &mem).unwrap(), [4343, 4444], "one window");
+    check(&runner::run(&one, &st, &mem).unwrap(), [table[1], table[2]], "one window");
     // several windows: a code address is in none of them, and window 0 holds other bytes at
-    // the table's offset; the V# is on the table
+    // the table's offset
     let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
     let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
@@ -492,7 +505,6 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
     *word(w1 + 0x900) = 4242;
     *word(w1 + 0x904) = 4343;
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
-    st.sgpr[4..7].copy_from_slice(&[block + 4, crate::gpu::recomp::CODE_ADDRESS_HI, 64]);
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
         r[12] = (w1 + 0x800 + 4 * l as u64) as u32;

@@ -4527,6 +4527,16 @@ fn gpu_loads_read_the_constant_data_after_the_program() {
             // memory, not the data: v[12:13] and s[2:3]
             ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
             ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+            // s[8:9]: the code address on one path, memory on the other – told at run time
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 0)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
         ])
     };
     // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
@@ -4545,6 +4555,7 @@ fn gpu_loads_read_the_constant_data_after_the_program() {
         assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
         assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
         assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        assert_eq!(r.sgpr[21..23], [table[3], 4343], "{what}: s_load of the table, then of memory, through one register pair");
         for l in 0..64usize {
             let k = l % 6;
             assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
@@ -4586,7 +4597,13 @@ fn gpu_loads_read_the_constant_data_after_the_program() {
     for heap in [false, true] {
         let t = translate(&code, &on_gpu(Options { mem_windows: 2, heap_windows: heap, rodata: rodata.clone(), ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported);
-        assert!(t.hlsl.contains(&format!("if (xcl_w == 0xC0DEu - xcl_uma_base && a - {block}u < 40u)")), "the data is at code addresses only:\n{}", t.hlsl);
+        // loads from s_getpc_b64 read the table only, the others the memory only; the load that
+        // may be either tells by the address's high dword, with no branch
+        let h = &t.hlsl;
+        assert_eq!(h.matches("= xcl_cload(").count(), 4, "s_load_dword and global_load_dwordx3 of the table:\n{h}");
+        assert!(h.contains("= xcl_cload4(") && h.contains("v8 = xcl_mLoad(("), "{h}");
+        assert_eq!(h.matches("= xcl_gload(").count(), 2, "the two loads through s[8:9]:\n{h}");
+        assert!(h.contains(&format!("bool xcl_code(uint hi, uint a) {{ return and(hi == 0xC0DEu, a - {block}u < 40u); }}")), "{h}");
         let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
         check(&runner::run_in_arena(&dxil, &st, &arena).unwrap(), if heap { "heap windows" } else { "two windows" });
     }
