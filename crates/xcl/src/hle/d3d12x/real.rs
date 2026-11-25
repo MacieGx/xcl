@@ -8498,6 +8498,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let submit_t0 = std::time::Instant::now();
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -8528,7 +8529,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         removed_probe("execute: before the PC call");
         let _ = super::alloc_pool::note_resubmits(this, chunk);
+        let t = std::time::Instant::now();
         f(this, chunk.len() as u32, chunk.as_ptr());
+        let t1 = std::time::Instant::now();
+        super::submit_cost::driver(t1 - t);
         removed_probe("execute: after the PC call");
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
@@ -8538,12 +8542,14 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         removed_probe("execute: after readback_sparse_writes");
         super::list_x::cpu_writes_after(this, chunk);
         removed_probe("execute: after cpu_writes_after");
+        super::submit_cost::after(t1.elapsed());
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     removed_probe("execute: end");
     stop_if_device_removed();
+    super::submit_cost::done(submit_t0);
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

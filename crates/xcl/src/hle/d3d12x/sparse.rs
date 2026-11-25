@@ -2182,6 +2182,11 @@ static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Microseconds so far in [looks for CPU writes, waits for the state lock, chunk scans, uploads].
+pub fn timing_totals() -> [u64; 4] {
+    [WATCH[0].load(Ordering::Relaxed), PHASES[0].load(Ordering::Relaxed), PHASES[1].load(Ordering::Relaxed), PHASES[2].load(Ordering::Relaxed)]
+}
+
 pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);

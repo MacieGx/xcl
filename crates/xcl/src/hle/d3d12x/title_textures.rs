@@ -1098,11 +1098,15 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
+    super::submit_cost::lock_wait(t0.elapsed());
     // with the lock: the look before this one is done, and its uploads are submitted
     let covered = super::look_join::covered(lists);
     let look = !(covered && super::look_join::joins());
+    let t1 = std::time::Instant::now();
     let took = own_work(|| refresh_once(queue, look));
+    super::submit_cost::refresh(t1.elapsed());
     super::look_join::submit_done(covered, took);
 }
 
