@@ -443,7 +443,57 @@ fn sample(counted: bool) -> GamepadState {
         super::kbm::apply,
         || scripted(counted),
     );
+    scripted_axes(&mut s, crate::log::uptime());
     s
+}
+
+/// lab: `XCL_STICK_AT=from-to:AXIS=value,…` ("200-215:RX=0.6,230-240:LX=-1"; seconds of uptime as
+/// the log's times; axes LX LY RX RY in -1..1, LT RT in 0..1): an axis held at a value for a
+/// while – a camera turned without a person at the controls.
+fn stick_script() -> &'static [(f64, f64, usize, f32)] {
+    static S: OnceLock<Vec<(f64, f64, usize, f32)>> = OnceLock::new();
+    S.get_or_init(|| parse_sticks(&std::env::var("XCL_STICK_AT").unwrap_or_default()))
+}
+
+const AXIS_NAMES: [&str; 6] = ["LX", "LY", "RX", "RY", "LT", "RT"];
+
+fn parse_sticks(script: &str) -> Vec<(f64, f64, usize, f32)> {
+    script
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|item| {
+            let (span, set) = item.split_once(':')?;
+            let (from, to) = span.split_once('-')?;
+            let (axis, value) = set.split_once('=')?;
+            let axis = AXIS_NAMES.iter().position(|n| n.eq_ignore_ascii_case(axis.trim()))?;
+            Some((from.trim().parse().ok()?, to.trim().parse().ok()?, axis, value.trim().parse::<f32>().ok()?.clamp(-1.0, 1.0)))
+        })
+        .collect()
+}
+
+fn apply_axes(s: &mut GamepadState, script: &[(f64, f64, usize, f32)], t: f64) -> u32 {
+    let mut held = 0;
+    for &(from, to, axis, value) in script {
+        if t >= from && t < to {
+            *[&mut s.left_x, &mut s.left_y, &mut s.right_x, &mut s.right_y, &mut s.left_trigger, &mut s.right_trigger][axis] = value;
+            held |= 1 << axis;
+        }
+    }
+    held
+}
+
+fn scripted_axes(s: &mut GamepadState, t: f64) {
+    let script = stick_script();
+    if script.is_empty() {
+        return;
+    }
+    static HELD: AtomicU32 = AtomicU32::new(0);
+    let held = apply_axes(s, script, t);
+    if HELD.swap(held, Ordering::Relaxed) != held {
+        let names: Vec<&str> = AXIS_NAMES.iter().enumerate().filter(|(k, _)| held >> k & 1 != 0).map(|(_, n)| *n).collect();
+        crate::xlog_info!("GameInput: scripted axes held from {t:.2} s: {}", if names.is_empty() { "none".into() } else { names.join(" ") });
+    }
 }
 
 /// the first presses of each button the title was handed: worth a line (is input arriving at all?)
@@ -1200,6 +1250,21 @@ mod tests {
         // the second press waits for the first to be up 100 ms and two readings
         assert_eq!(seen.len(), 2);
         assert!((1.3..1.32).contains(&seen[1].0), "second press first seen at {}", seen[1].0);
+    }
+
+    #[test]
+    fn stick_script_holds_an_axis_between_its_times() {
+        let script = parse_sticks("200-215:RX=0.6, 230-240:lx=-2,bad,5:RX=1");
+        assert_eq!(script, vec![(200.0, 215.0, 2, 0.6), (230.0, 240.0, 0, -1.0)]);
+        let mut s = GamepadState::default();
+        assert_eq!(apply_axes(&mut s, &script, 199.9), 0);
+        assert_eq!(s.right_x, 0.0);
+        assert_eq!(apply_axes(&mut s, &script, 200.0), 1 << 2);
+        assert_eq!(s.right_x, 0.6);
+        let mut s = GamepadState::default();
+        assert_eq!(apply_axes(&mut s, &script, 215.0), 0);
+        assert_eq!(apply_axes(&mut s, &script, 231.0), 1);
+        assert_eq!((s.left_x, s.right_x), (-1.0, 0.0));
     }
 
     #[test]

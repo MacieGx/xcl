@@ -666,6 +666,47 @@ type Transition = (usize, u32, D3D12_RESOURCE_STATES);
 /// PC command list → the transitions of textures kept in step it recorded since it was made or
 /// last reset, in order. They apply when the list is submitted – each time: a closed list may
 /// run again.
+/// lab (`XCL_MEM_REGIONS=1`): how much of the sparse windows' video memory (`runs`: sorted
+/// runs of mapped 64 KiB tiles) lies under the bytes textures are read from, which have their
+/// own pages in video memory too: (bytes under textures, tiles wholly under them, textures).
+pub fn under_sources(runs: &[(usize, usize)]) -> (usize, usize, usize) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut n = 0;
+    {
+        let t = TEXTURES.lock().unwrap();
+        for (&(va, res), &end) in t.by_va.iter() {
+            let Some(e) = t.by_res.get(&res) else { continue };
+            if e.gpu_written {
+                continue;
+            }
+            n += 1;
+            match &e.src {
+                Source::At(a) => spans.push((*a, *a + (end - va))),
+                Source::Pages(r) => spans.extend(r.iter().filter(|r| r.2 != 0).map(|r| (r.2, r.2 + r.1))),
+            }
+        }
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let (mut bytes, mut whole) = (0, 0);
+    for &(lo, hi) in runs {
+        let mut k = merged.partition_point(|m| m.1 <= lo);
+        while let Some(&(a, b)) = merged.get(k).filter(|m| m.0 < hi) {
+            let (a, b) = (a.max(lo), b.min(hi));
+            bytes += b - a;
+            whole += (b >> 16).saturating_sub((a + 0xFFFF) >> 16);
+            k += 1;
+        }
+    }
+    (bytes, whole, n)
+}
+
 static LIST_NOTES: Mutex<BTreeMap<usize, Vec<Transition>>> = Mutex::new(BTreeMap::new());
 
 /// Whether any texture is kept in step (callers skip collecting transitions otherwise).

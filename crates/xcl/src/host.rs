@@ -204,6 +204,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         }
                         at = m.BaseAddress as usize + m.RegionSize;
                     }
+                    // lab: sparse-window tiles that hold what textures were filled from
+                    {
+                        let runs = crate::hle::d3d12x::sparse::mapped_ranges();
+                        let (bytes, whole, n) = crate::hle::d3d12x::title_textures::under_sources(&runs);
+                        crate::xlog_info!(
+                            "memory lab: sparse windows: {} MB of tiles mapped, {} MB of them under the bytes of {n} CPU-filled textures ({} MB in tiles wholly under them)",
+                            mb(runs.iter().map(|r| (r.1 - r.0) as u64).sum()),
+                            mb(bytes as u64),
+                            mb((whole as u64) << 16)
+                        );
+                    }
                     // allocations by size class: how much of the working set each class holds
                     let mut classes = [(0u64, 0u32); 6];
                     for &(r, _, span, _) in by_base.values() {
@@ -251,6 +262,19 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 last = now;
             }
         });
+    }
+    // lab: `XCL_WS_MAX_MB=n` – a hard maximum for the working set: Windows takes the pages
+    // used least recently out of it (to the page file; a later touch brings one back) instead
+    // of the PC running out of RAM. A retail title's working set grows by ~20 MB a second in
+    // its world, most of it memory written once (streamed textures the GPU already has).
+    if let Some(mb) = std::env::var("XCL_WS_MAX_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1024) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetProcessWorkingSetSizeEx(process: *mut std::ffi::c_void, min: usize, max: usize, flags: u32) -> i32;
+        }
+        // QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE
+        let ok = unsafe { SetProcessWorkingSetSizeEx(windows_sys::Win32::System::Threading::GetCurrentProcess() as *mut _, 256 << 20, mb << 20, 2 | 4) };
+        crate::xlog_info!("memory lab: working set limited to {mb} MB (XCL_WS_MAX_MB): {}", if ok != 0 { "set".to_string() } else { format!("failed, {}", std::io::Error::last_os_error()) });
     }
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
