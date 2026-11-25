@@ -866,6 +866,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     EI_NAMED.lock().unwrap().push((slot, hash, gfx));
                 }
             }
+            // lab: a compute call's record as the title wrote it (before it is bounded), up to 64
+            // a program: how many groups its dispatches ask for (D3D12 takes 65535 a dimension,
+            // `indirect_clamp` cuts there; the console takes more)
+            if !gfx && n <= 64 && bounded.is_some() {
+                if let Some(slot) = ei_peek_slot(this, 40, max, args, args_off, count_buf, count_off) {
+                    EI_WIDE.lock().unwrap().push((slot, hash));
+                }
+            }
         }
     }
     if gfx {
@@ -1215,6 +1223,9 @@ unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, 
 static EI_NAMED: Mutex<Vec<(usize, u64, bool)>> = Mutex::new(Vec::new());
 static EI_NAMED_DONE: AtomicU64 = AtomicU64::new(0);
 
+/// lab (`XCL_EI_PEEK`): (slot, CS record hash) of compute records as the title wrote them
+static EI_WIDE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
 fn ei_peek_report() {
     let g = EI_PEEK.lock().unwrap();
     let Some(pk) = g.as_ref() else { return };
@@ -1224,6 +1235,34 @@ fn ei_peek_report() {
             return;
         }
         let w = |slot: usize, k: usize| (p as *const u32).add(slot * 8 + k).read_unaligned();
+        {
+            // CS -> (records read, with more than 65535 groups in a dimension, the widest)
+            let mut by: std::collections::BTreeMap<u64, (u32, u32, [u32; 3])> = Default::default();
+            for &(slot, hash) in EI_WIDE.lock().unwrap().iter() {
+                let a = [w(slot, 0), w(slot, 1), w(slot, 2)];
+                if a[0] == 0xEEEE_EEEE {
+                    continue;
+                }
+                let e = by.entry(hash).or_default();
+                e.0 += 1;
+                if a.iter().any(|&v| v > 65535) {
+                    e.1 += 1;
+                }
+                if a[0] >= e.2[0] {
+                    e.2 = a;
+                }
+            }
+            let read: u32 = by.values().map(|e| e.0).sum();
+            let over: u32 = by.values().map(|e| e.1).sum();
+            let mut wide: Vec<(u64, (u32, u32, [u32; 3]))> = by.iter().filter(|e| e.1 .1 > 0).map(|(&h, &e)| (h, e)).collect();
+            wide.sort_by_key(|e| std::cmp::Reverse(e.1 .2[0]));
+            crate::xlog_info!(
+                "ei wide: {read} compute records of {} programs read as the title wrote them, {over} ask for more than 65535 groups in a dimension ({} programs): {}",
+                by.len(),
+                wide.len(),
+                wide.iter().take(24).map(|(h, e)| format!("{h:016x} {} of {} widest {:?}", e.1, e.0, e.2)).collect::<Vec<_>>().join("; ")
+            );
+        }
         {
             let named = EI_NAMED.lock().unwrap();
             let from = EI_NAMED_DONE.load(Ordering::Relaxed) as usize;
