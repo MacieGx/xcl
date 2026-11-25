@@ -59,6 +59,15 @@ impl Lw {
         if !self.windowed() {
             return;
         }
+        // `XCL_WINDOW_NO_CARRY=1` (xcl-dev/xcl pull request 2496): the window of the base address.
+        // Allocations do not straddle windows, so an access inside the allocation its base points
+        // into never carries or borrows into the high dword. Accesses off one base then share
+        // their window, its range check and its heap handle: less code in the driver for big
+        // compute programs (NVIDIA's shader code heap is limited, issue 2403).
+        if self.no_carry {
+            self.window_hi(hi, write);
+            return;
+        }
         let mut ea = self.pack64(lo, hi);
         for &t in adds {
             let x = match t {

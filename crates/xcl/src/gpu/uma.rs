@@ -334,13 +334,16 @@ impl Uma {
             return None;
         }
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
+        // `XCL_WINDOW_NO_CARRY=1`: a reservation of 4 GiB or less stays inside one window (shaders
+        // then take an access's window from its base address)
+        let one_window = crate::gpu::dxil::kernel::window_no_carry();
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
+        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, one_window) {
             return Some(at);
         }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        take_sparse_in(&mut g, lo, end, size, GRAIN, one_window)
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor

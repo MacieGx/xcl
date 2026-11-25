@@ -494,6 +494,39 @@ struct Pages {
     evict_idle_until: Option<std::time::Instant>,
     /// page budget: pool heaps the pages may take (`pool_cap`; 0: no limit)
     cap: usize,
+    /// lab (`XCL_ZERO_TARGET_PAGES=1`): what zeroes pool tiles (`Pages::scrub`)
+    scrub: Option<Scrub>,
+}
+
+/// tiles `Pages::scrub` zeroes with one copy (16 MiB)
+const SCRUB_TILES: usize = 256;
+
+/// Lab (`XCL_ZERO_TARGET_PAGES=1`): a reserved buffer mapped onto pool tiles for a moment and a
+/// buffer of zeros copied over it – a tile of a pool heap cannot be written any other way before
+/// a texture is mapped onto it.
+struct Scrub {
+    over: ID3D12Resource,
+    zeros: ID3D12Resource,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    /// `Pages::value` after the last copy (the allocator is reset once the fence is there)
+    busy: u64,
+}
+
+/// lab: `XCL_ZERO_TARGET_PAGES=1` – pool tiles given to a render target, depth buffer or UAV
+/// texture are zeroed first. A tile comes back from evicted streamed textures with their bytes,
+/// and a retail title reads targets it has not written everywhere (history, layers only some of
+/// its passes fill): it then read texture bytes as radiance.
+fn zero_target_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ZERO_TARGET_PAGES").is_ok_and(|v| v.trim() == "1"))
+}
+
+static SCRUBBED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// lab: tiles zeroed so far (`XCL_ZERO_TARGET_PAGES`)
+pub fn scrubbed_tiles() -> u64 {
+    SCRUBBED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // D3D12 objects are free-threaded
@@ -533,7 +566,114 @@ impl Pages {
             scratch_counts: Vec::new(),
             evict_idle_until: None,
             cap: pool_cap(),
+            scrub: None,
         })
+    }
+
+    /// Lab (`XCL_ZERO_TARGET_PAGES=1`): zero the pool tiles `tiles` on the mapping queue, before
+    /// anything is mapped onto them (the title's queues wait for this queue's fence).
+    unsafe fn scrub(&mut self, dev: &ID3D12Device, tiles: &[Tile]) {
+        if self.scrub.is_none() {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (SCRUB_TILES * PAGE) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let made = super::title_textures::own_work(|| -> windows::core::Result<Scrub> {
+                let mut over: Option<ID3D12Resource> = None;
+                dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut over)?;
+                let mut zeros: Option<ID3D12Resource> = None;
+                // (a committed buffer is made of zeros)
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut zeros,
+                )?;
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+                list.Close()?;
+                let (Some(over), Some(zeros)) = (over, zeros) else { return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)) };
+                Ok(Scrub { over, zeros, alloc, list, busy: 0 })
+            });
+            match made {
+                Ok(s) => self.scrub = Some(s),
+                Err(e) => {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::xlog_warn!("D3D12.X: lab: XCL_ZERO_TARGET_PAGES: nothing to zero tiles with ({e})");
+                    }
+                    return;
+                }
+            }
+        }
+        let mut sorted: Vec<Tile> = tiles.to_vec();
+        sorted.sort_unstable();
+        for chunk in sorted.chunks(SCRUB_TILES) {
+            let Some(sc) = self.scrub.as_ref() else { return };
+            // the copy before this one has run (its allocator is used again)
+            if sc.busy != 0 && self.fence.GetCompletedValue() < sc.busy {
+                let _ = self.fence.SetEventOnCompletion(sc.busy, windows::Win32::Foundation::HANDLE::default());
+            }
+            // tile i of the buffer over `chunk[i]`: one call per pool heap
+            let mut at = 0usize;
+            while at < chunk.len() {
+                let h = chunk[at].0;
+                let n = chunk[at..].iter().take_while(|t| t.0 == h).count();
+                let (mut offsets, mut counts): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+                for &(_, t) in &chunk[at..at + n] {
+                    match (offsets.last(), counts.last_mut()) {
+                        (Some(&o), Some(c)) if o + *c == t => *c += 1,
+                        _ => {
+                            offsets.push(t);
+                            counts.push(1);
+                        }
+                    }
+                }
+                let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; offsets.len()];
+                let coord = D3D12_TILED_RESOURCE_COORDINATE { X: at as u32, ..Default::default() };
+                let region = D3D12_TILE_REGION_SIZE { NumTiles: n as u32, UseBox: false.into(), ..Default::default() };
+                self.queue.UpdateTileMappings(
+                    &sc.over,
+                    1,
+                    Some(&coord),
+                    Some(&region),
+                    &self.pools[h as usize],
+                    offsets.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+                at += n;
+            }
+            if sc.alloc.Reset().is_err() || sc.list.Reset(&sc.alloc, None).is_err() {
+                return;
+            }
+            sc.list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64);
+            if sc.list.Close().is_err() {
+                return;
+            }
+            let Ok(cl) = sc.list.cast::<ID3D12CommandList>() else { return };
+            self.queue.ExecuteCommandLists(&[Some(cl)]);
+            self.value += 1;
+            let _ = self.queue.Signal(&self.fence, self.value);
+            let busy = self.value;
+            if let Some(sc) = self.scrub.as_mut() {
+                sc.busy = busy;
+            }
+            let n = SCRUBBED.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed) + chunk.len() as u64;
+            if n == chunk.len() as u64 {
+                crate::xlog_info!("D3D12.X: lab: XCL_ZERO_TARGET_PAGES: pool tiles given to render targets / UAV textures are zeroed first");
+            }
+        }
     }
 
     /// Pages no resource used for `IDLE` go back to the pools.
@@ -772,6 +912,13 @@ impl Pages {
             pools.push(heap);
             Some(pools.len() as u32 - 1)
         })?;
+        // lab: a target the GPU fills starts from zeros, not from what the tile held
+        if !fresh.is_empty()
+            && zero_target_pages()
+            && res.GetDesc().Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0
+        {
+            self.scrub(dev, &fresh);
+        }
         let mut fresh_iter = fresh.into_iter();
 
         let mut tiles = Vec::with_capacity(total as usize);

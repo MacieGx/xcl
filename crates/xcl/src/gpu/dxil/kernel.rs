@@ -39,6 +39,17 @@ pub struct KernelOptions {
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 10;
 
+/// Flag in `KernelOptions::mem_windows` (next to `recomp::HEAP_WINDOWS`; part of a compute
+/// program's cache key, `pso::console_to_dxil_in`): accesses take their base address's window
+/// (`lower_window::window_at`). From xcl-dev/xcl pull request 2496 (`XCL_WINDOW_NO_CARRY=1`).
+pub const WINDOW_NO_CARRY: u32 = 0x400;
+
+/// `XCL_WINDOW_NO_CARRY=1`: compute programs take an access's memory window from its base address.
+pub fn window_no_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WINDOW_NO_CARRY").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -139,7 +150,7 @@ pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodat
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | WINDOW_NO_CARRY)).clamp(1, 4);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -452,6 +463,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            no_carry: o.mem_windows & WINDOW_NO_CARRY != 0,
             res,
             fmt_table: None,
             rodata: Vec::new(),

@@ -149,6 +149,9 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    // `XCL_WINDOW_NO_CARRY=1`: another output of a compute program, so another cache key
+    let no_carry = stage == Stage::Compute && windows & 0xFF > 1 && crate::gpu::dxil::kernel::window_no_carry();
+    let windows = if no_carry { windows | crate::gpu::dxil::kernel::WINDOW_NO_CARRY } else { windows };
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
@@ -361,11 +364,13 @@ mod translated {
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    // (`WINDOW_NO_CARRY` is for the direct translator's compute programs only)
+    let (windows, direct_windows) = (windows & !crate::gpu::dxil::kernel::WINDOW_NO_CARRY, windows);
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
         defer_direct_compute()?;
-        match direct_compute(blob, sampler_base, windows, split_wave64) {
+        match direct_compute(blob, sampler_base, direct_windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
                 return Ok(c);
@@ -378,7 +383,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     if stage == Stage::Compute && !crate::gpu::dxil::kernel::enabled() {
         if let Some(min) = huge_direct_min() {
             defer_direct_compute()?;
-            match direct_compute(blob, sampler_base, windows, split_wave64) {
+            match direct_compute(blob, sampler_base, direct_windows, split_wave64) {
                 Ok(c) if c.dxil.len() >= min => {
                     crate::xlog_info!("[SHADER] huge compute program {:016x}: direct DXIL ({} B)", crate::gpu::shader::fnv64(blob), c.dxil.len());
                     return Ok(c);
