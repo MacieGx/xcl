@@ -188,6 +188,13 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     found
 }
 
+/// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
+/// submitted again before that; `title_list` records the title's next recording elsewhere).
+pub fn in_flight(list: usize) -> bool {
+    let g = STATE.lock().unwrap();
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+}
+
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !enabled() || queue.is_null() {

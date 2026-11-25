@@ -2713,6 +2713,45 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
+/// The title Resets its list (`title_list` `wrapper`) while the GPU has not finished the last
+/// submit of the PC list `primary` behind it: a console lets the title submit the new recording
+/// at once, the PC does not let `primary` be submitted again yet (#1452, debug layer id 553;
+/// NVIDIA removes the device). The new recording goes onto a spare PC list of the wrapper whose
+/// submits are done, or a new one, reset like `primary` would be. None: it could not be.
+pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, alloc: usize, pso: usize) -> Option<usize> {
+    let ty = list_type(primary);
+    if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE || alloc == 0 {
+        return None;
+    }
+    let spare = match super::title_list::pop_spare(wrapper) {
+        Some(p) => p,
+        None => {
+            let pc_alloc = super::alloc_pool::current(alloc);
+            let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?;
+            on_create(made, pc_alloc, 0, ty);
+            // (closed: it is reset below like a spare)
+            let ext = *(made as *const usize);
+            let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+            real::preserve_vtable(made, ext);
+            if hr < 0 {
+                super::title_list::put_spare(wrapper, made);
+                return None;
+            }
+            made
+        }
+    };
+    if reset_pc(spare, alloc, pso) < 0 {
+        super::title_list::put_spare(wrapper, spare);
+        return None;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a command list reset while its last submit is on the GPU records on another PC list (#{n})");
+    }
+    Some(spare as usize)
+}
+
 /// Deferred mid-list split for `Wait32/64BitValueX` recorded after a `Write64BitValue*` in the
 /// same command list: closes `list` (preserving its earlier `Write64` signals on segment N) and
 /// opens/reuses a sibling PC command list on the same `ID3D12CommandAllocator` as segment N+1,
@@ -3974,12 +4013,28 @@ fn is_occlusion(ty: D3D12_QUERY_TYPE) -> bool {
 
 type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32);
 
-/// command list #10 Reset(allocator, initial pipeline): updates allocator/pipeline and clears
-/// per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
+/// command list #10 Reset(allocator, initial pipeline) as console code calls it on a PC list.
+/// When `this` is the PC list a title's list (`title_list`) records on, the call came through
+/// that list's thunk to its PC list – the newer console layout's Reset (#139, allocator, NULL,
+/// 0) does, as it is not the title list's own #10 – and it is that list's Reset (`title_list::
+/// reset`: the primary PC list again, or a stand-in while the primary's last submit runs). Else
+/// `reset_pc`.
 ///
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    if let Some(w) = super::title_list::wrapper_of(this) {
+        return super::title_list::reset(w, alloc, pso);
+    }
+    reset_pc(this, alloc, pso)
+}
+
+/// Reset of the PC list `this` (allocator, initial pipeline): updates allocator/pipeline and
+/// clears per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
@@ -7100,6 +7155,84 @@ mod tests {
 
             crate::gpu::fence::wait(&done1, 1, &dev, None, 2000).expect("q1 must complete after watchdog CPU signal");
             crate::gpu::fence::wait(&done2, 1, &dev, None, 2000).expect("q2 must complete after watchdog CPU signal");
+        }
+    }
+
+    /// #1452: the title Resets its list and submits the new recording while the GPU still runs
+    /// the previous one (held here by a queue Wait on a fence not yet signalled). The new
+    /// recording must be on another PC list (the PC forbids submitting one again before its last
+    /// submit is done, debug layer id 553), also one more time; once the GPU is done, the list
+    /// records on its own PC list again. Both ways a title Resets: the list's #10, and the newer
+    /// console layout's #139, which goes through the list's thunk to the PC list it records on
+    /// (`reset_x` on that one) – the retail title's way, which the stand-in did not see at first.
+    #[test]
+    fn a_reset_while_the_last_submit_runs_records_on_another_pc_list() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        for newer_layout in [false, true] {
+            reset_while_the_last_submit_runs(&dev, newer_layout);
+        }
+    }
+
+    fn reset_while_the_last_submit_runs(dev: &ID3D12Device, newer_layout: bool) {
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(primary, real::Kind::CommandList);
+            on_create(primary, a, 0, ty);
+            super::super::bind::reset(primary, a, 0);
+            let w = super::super::title_list::wrap(primary);
+            let slot = |i: usize| *(*(w as *const *const usize)).add(i);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(slot(9));
+            let reset_10: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(slot(10));
+            // #139 (allocator, NULL, 0): the thunk passes the PC list last recorded on (`F_BACKING`)
+            let reset = |w: *mut c_void, a: usize, pso: usize, last: *mut c_void| if newer_layout { reset_x(last, a, pso) } else { reset_10(w, a, pso) };
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            // Close, then submit as ExecuteCommandLists does: the PC lists the title's list stands for
+            let submit = || {
+                assert_eq!(close(w), 0);
+                let mut segs = Vec::new();
+                assert!(super::super::title_list::push_segments(w, &mut segs));
+                let again = super::super::alloc_pool::note_resubmits(q.as_raw(), &segs);
+                exec(q.as_raw(), segs.len() as u32, segs.as_ptr());
+                super::super::alloc_pool::executed(q.as_raw(), &segs);
+                (segs, again)
+            };
+
+            q.Wait(&gate, 1).unwrap();
+            let (first, _) = submit();
+            assert_eq!(first, vec![primary]);
+            assert_eq!(reset(w, a, 0, first[0]), 0);
+            let (second, again) = submit();
+            assert_eq!(reset(w, a, 0, second[0]), 0);
+            let (third, again3) = submit();
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the queue finishes");
+            assert_eq!(reset(w, a, 0, third[0]), 0);
+            let (fourth, _) = submit();
+            q.Signal(&done, 2).unwrap();
+            crate::gpu::fence::wait(&done, 2, &dev, None, 5000).expect("the queue finishes");
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+
+            let how = if newer_layout { "Reset #139" } else { "Reset #10" };
+            assert_eq!(second.len(), 1);
+            assert_ne!(second[0], primary, "{how}: the new recording must not be on the PC list still on the GPU");
+            assert_eq!(again, 0, "{how}: no PC list is submitted while its last submit runs");
+            assert_eq!(third.len(), 1);
+            assert!(third[0] != primary && third[0] != second[0], "{how}: nor on the one standing in, also still on the GPU");
+            assert_eq!(again3, 0, "{how}");
+            assert_eq!(fourth, vec![primary], "{how}: once the GPU is done the list records on its own PC list");
+            assert!(removed.is_ok());
         }
     }
 
