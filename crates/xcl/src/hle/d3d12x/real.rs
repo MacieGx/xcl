@@ -8664,6 +8664,12 @@ pub fn log_device_removed() {
     if let Some(code) = super::pso_async::code_now() {
         crate::xlog_error!("shader code lab: at the removal: {code}");
     }
+    // (to rule the system's memory in or out: a removal with no fault of the GPU's had 30 GB of
+    // commit left)
+    let (commit, limit) = crate::host::system_commit();
+    if limit != 0 {
+        crate::xlog_error!("system commit at the removal: {} of {} MB ({} MB left)", commit >> 20, limit >> 20, limit.saturating_sub(commit) >> 20);
+    }
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
