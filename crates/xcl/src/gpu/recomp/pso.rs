@@ -152,6 +152,9 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // `XCL_WINDOW_NO_CARRY=1`: another output of a compute program, so another cache key
     let no_carry = stage == Stage::Compute && windows & 0xFF > 1 && crate::gpu::dxil::kernel::window_no_carry();
     let windows = if no_carry { windows | crate::gpu::dxil::kernel::WINDOW_NO_CARRY } else { windows };
+    // lab (`XCL_FOLD_GROUPS`): a program with a folded group id is another output too
+    let fold = stage == Stage::Compute && crate::gpu::dxil::kernel::fold_groups(crate::gpu::shader::fnv64(blob));
+    let windows = if fold { windows | crate::gpu::dxil::kernel::FOLD_GROUPS } else { windows };
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
@@ -365,7 +368,14 @@ mod translated {
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     // (`WINDOW_NO_CARRY` is for the direct translator's compute programs only)
-    let (windows, direct_windows) = (windows & !crate::gpu::dxil::kernel::WINDOW_NO_CARRY, windows);
+    let (windows, direct_windows) = (windows & !(crate::gpu::dxil::kernel::WINDOW_NO_CARRY | crate::gpu::dxil::kernel::FOLD_GROUPS), windows);
+    // lab (`XCL_FOLD_GROUPS`): only the direct translator folds the group id – it or nothing
+    if stage == Stage::Compute && direct_windows & crate::gpu::dxil::kernel::FOLD_GROUPS != 0 {
+        defer_direct_compute()?;
+        let c = direct_compute(blob, sampler_base, direct_windows, split_wave64).map_err(|e| format!("XCL_FOLD_GROUPS: no direct translation: {}", e.lines().next().unwrap_or("")))?;
+        crate::xlog_info!("[SHADER] lab: compute program {:016x} with a folded group id ({} B of direct DXIL)", crate::gpu::shader::fnv64(blob), c.dxil.len());
+        return Ok(c);
+    }
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {

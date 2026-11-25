@@ -36,15 +36,23 @@ uint sat_add(uint a, uint b) {
 
 // Clamps one record's arguments in place and returns the work they ask for.
 uint clamp_args(inout uint3 a) {
-    if (kind <= 1) {
+    // lab: kind >> 8 = groups a row for a program with a folded group id (`kernel::FOLD_GROUPS`)
+    uint fold = kind >> 8;
+    uint k = kind & 0xFF;
+    if (k <= 1) {
         a.x = min(a.x, MAX_VERTICES);
         a.y = min(a.y, MAX_VERTEX_INSTANCES / max(a.x, 1u));
         return a.x * a.y;
     }
+    // a 1-D dispatch of more groups than D3D12 takes in a dimension, as whole rows
+    if (fold != 0 && a.x > MAX_GROUPS_DIM && a.y == 1 && a.z == 1 && a.x % fold == 0) {
+        a.y = a.x / fold;
+        a.x = fold;
+    }
     a = min(a, uint3(MAX_GROUPS_DIM, MAX_GROUPS_DIM, MAX_GROUPS_DIM));
     a.y = min(a.y, MAX_GROUPS / max(a.x, 1u));
     a.z = min(a.z, MAX_GROUPS / max(a.x * a.y, 1u));
-    return a.x * a.y * a.z * (kind == 3 ? 128u : 64u);
+    return a.x * a.y * a.z * (k == 3 ? 128u : 64u);
 }
 
 [numthreads(THREADS, 1, 1)]
@@ -79,7 +87,7 @@ void main(uint t : SV_GroupIndex) {
         uint total = sat_add(carry, scan[t]);
         if (i < records) {
             if (total > budget) {
-                if (kind <= 1)
+                if ((kind & 0xFF) <= 1)
                     a.y = 0;
                 else
                     a = uint3(0, 0, 0);

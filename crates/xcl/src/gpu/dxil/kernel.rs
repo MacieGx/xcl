@@ -44,6 +44,21 @@ pub const TRANSLATOR_VERSION: u32 = 10;
 /// (`lower_window::window_at`). From xcl-dev/xcl pull request 2496 (`XCL_WINDOW_NO_CARRY=1`).
 pub const WINDOW_NO_CARRY: u32 = 0x400;
 
+/// Lab flag in `KernelOptions::mem_windows` (part of the program's cache key): the compute
+/// program's group id is folded – x = SV_GroupID.x + SV_GroupID.y * `FOLD_ROW`, y = 0 – so that a
+/// 1-D dispatch of more groups than D3D12 takes in a dimension (65535) runs as rows
+/// (`XCL_FOLD_GROUPS`, `indirect_clamp`). The idea of running the surplus as rows is VIctory's
+/// (GPL-3.0; no code taken).
+pub const FOLD_GROUPS: u32 = 0x800;
+/// groups in a row of a folded dispatch (a 2560x1440 list of 32-pixel groups is 3 rows)
+pub const FOLD_ROW: u32 = 38400;
+
+/// Lab (`XCL_FOLD_GROUPS=<cs record hash>,...`): the compute programs whose group id is folded.
+pub fn fold_groups(record: u64) -> bool {
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::env::var("XCL_FOLD_GROUPS").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect()).contains(&record)
+}
+
 /// `XCL_WINDOW_NO_CARRY=1`: compute programs take an access's memory window from its base address.
 pub fn window_no_carry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -150,7 +165,7 @@ pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodat
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | WINDOW_NO_CARRY)).clamp(1, 4);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | WINDOW_NO_CARRY | FOLD_GROUPS)).clamp(1, 4);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -464,6 +479,7 @@ impl Lw {
             mems,
             heap_mem,
             no_carry: o.mem_windows & WINDOW_NO_CARRY != 0,
+            fold_groups: o.mem_windows & FOLD_GROUPS != 0,
             res,
             fmt_table: None,
             rodata: Vec::new(),
@@ -626,6 +642,17 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     for k in 0..3 {
         if cs.tgid[k] {
             let g = lw.s.group_id(k as u32);
+            // lab (`FOLD_GROUPS`): rows of a 1-D dispatch
+            let g = match (lw.fold_groups, k) {
+                (true, 0) => {
+                    let y = lw.s.group_id(1);
+                    let row = lw.c(FOLD_ROW);
+                    let up = lw.mul(y, row);
+                    lw.add(g, up)
+                }
+                (true, 1) => lw.c(0),
+                _ => g,
+            };
             sgpr.insert(next, g);
             next += 1;
         }

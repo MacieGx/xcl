@@ -271,7 +271,21 @@ unsafe fn in_window(res: usize, offset: u64, bytes: u64) -> Option<(u64, u32)> {
 
 /// The config words for a call: max records, where they are, the signature and the count.
 fn config(sig: Signature, max: u32, source_at: u32, count_at: Option<u32>, budget: u32) -> [u32; CONFIG_WORDS as usize] {
-    [max, source_at, sig.stride, sig.action_at, sig.kind, count_at.unwrap_or(NO_COUNT), budget]
+    [max, source_at, sig.stride, sig.action_at, sig.kind | FOLD.with(|f| f.get()) << 8, count_at.unwrap_or(NO_COUNT), budget]
+}
+
+thread_local! {
+    /// lab: groups a row for the dispatch records being bounded on this thread (`with_fold`)
+    static FOLD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Lab (`XCL_FOLD_GROUPS`): `f` with dispatch records of more than 65535 groups in x bounded
+/// to rows of `row` groups (for a program that folds its group id); 0: cut, as always.
+pub(super) fn with_fold<R>(row: u32, f: impl FnOnce() -> R) -> R {
+    let was = FOLD.with(|c| c.replace(row));
+    let r = f();
+    FOLD.with(|c| c.set(was));
+    r
 }
 
 unsafe fn transition(list: &ID3D12GraphicsCommandList, r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {

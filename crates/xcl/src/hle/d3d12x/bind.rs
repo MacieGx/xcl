@@ -841,7 +841,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     // the records bounded on the GPU first (a garbage record would hang it): this changes the
     // list's compute bindings, which `bind_abi` sets again
-    let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+    // lab (`XCL_FOLD_GROUPS`): a program with a folded group id gets its wide records as rows
+    let fold = if !gfx && super::real::pso_shaders(pso).is_some_and(|s| crate::gpu::dxil::kernel::fold_groups(s.0)) { crate::gpu::dxil::kernel::FOLD_ROW } else { 0 };
+    let bounded = super::indirect_clamp::with_fold(fold, || super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off));
     match &bounded {
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), b.offset(), count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),

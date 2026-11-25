@@ -157,6 +157,8 @@ pub struct Lw {
     pub heap_mem: Option<bool>,
     /// an access takes the window of its base address (`kernel::WINDOW_NO_CARRY`)
     pub no_carry: bool,
+    /// lab: the group id is folded (`kernel::FOLD_GROUPS`)
+    pub fold_groups: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
