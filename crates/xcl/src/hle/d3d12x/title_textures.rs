@@ -1098,6 +1098,10 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    // lab (`XCL_VIEW_NO_WAIT=1`): the view memory the lists read is uploaded before they run
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::view_mem::before_execute(q);
+    }
     let t0 = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
     super::submit_cost::lock_wait(t0.elapsed());
