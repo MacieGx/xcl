@@ -1080,7 +1080,9 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 /// made ~66 submits a frame on one thread, each behind a 7 ms look over ~11 GiB.
 fn hot_looks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_WATCH_HOT").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| // lab tree: OFF unless XCL_WATCH_HOT=1 - run O10 with it on stopped presenting at 255 s and the title
+    // crashed at 392 s (one run; not known to be its doing)
+    std::env::var("XCL_WATCH_HOT").is_ok_and(|v| v.trim() == "1"))
 }
 
 const HOT_BLOCK: usize = 2 << 20;
