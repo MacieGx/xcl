@@ -727,7 +727,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             #[allow(non_snake_case)]
             let RES_BYTES: u64 = *RES_MB.get_or_init(|| std::env::var("XCL_TWO_PASS_RES_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32u64).clamp(1, 128)) << 20;
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
-            let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
+            let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::budget())) as u32;
             ei_peek(this, 3, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             // lab: `XCL_TWO_PASS_UNBOUNDED=1`: the passes read the title's records as they are
             static UNBOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

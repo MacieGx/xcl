@@ -31,6 +31,17 @@ const MAX_BYTES: u64 = 16 << 20;
 const CONFIG_WORDS: u32 = 7;
 /// work one call may ask for, in threads (a group counts as 64, a mesh group as 128)
 pub(super) const BUDGET: u32 = 1 << 29;
+
+/// lab: `XCL_CLAMP_TIGHT=1` – 2^18 groups a record and 2^26 threads a call (see the shader)
+pub(super) fn tight() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_CLAMP_TIGHT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The work one call may ask for (`BUDGET`; 2^26 with `XCL_CLAMP_TIGHT=1`).
+pub(super) fn budget() -> u32 {
+    if tight() { 1 << 26 } else { BUDGET }
+}
 const NO_COUNT: u32 = u32::MAX;
 
 pub(super) fn enabled() -> bool {
@@ -297,7 +308,7 @@ unsafe fn in_window(res: usize, offset: u64, bytes: u64) -> Option<(u64, u32)> {
 
 /// The config words for a call: max records, where they are, the signature and the count.
 fn config(sig: Signature, max: u32, source_at: u32, count_at: Option<u32>, budget: u32) -> [u32; CONFIG_WORDS as usize] {
-    [max, source_at, sig.stride, sig.action_at, sig.kind | FOLD.with(|f| f.get()) << 8, count_at.unwrap_or(NO_COUNT), budget]
+    [max, source_at, sig.stride, sig.action_at, sig.kind | FOLD.with(|f| f.get()) << 8 | (tight() as u32) << 31, count_at.unwrap_or(NO_COUNT), budget]
 }
 
 thread_local! {
@@ -630,7 +641,7 @@ pub(super) unsafe fn bound_in_run(
 pub(super) unsafe fn bound(
     list: &ID3D12GraphicsCommandList, allocator: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64,
 ) -> Option<Bounded> {
-    bound_within(list, allocator, sig, max, args, args_off, count_buf, count_off, BUDGET)
+    bound_within(list, allocator, sig, max, args, args_off, count_buf, count_off, budget())
 }
 
 /// [`bound`] with the call's work limited to `budget` threads (a mesh group counts as 128):

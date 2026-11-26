@@ -47,8 +47,13 @@ uint sat_add(uint a, uint b) {
 // Clamps one record's arguments in place and returns the work they ask for.
 uint clamp_args(inout uint3 a) {
     // lab: kind >> 8 = groups a row for a program with a folded group id (`kernel::FOLD_GROUPS`)
-    uint fold = kind >> 8;
+    uint fold = (kind >> 8) & 0x7FFFFFu;
     uint k = kind & 0xFF;
+    // lab (`XCL_CLAMP_TIGHT=1`, bit 31 of kind): 2^18 groups a record. A garbage record clamped to
+    // [65535, 64, 1] on a heavy program ran past the 2 s the driver gets (jessenic's runs on #1795:
+    // 7 of 7 ended in 0x887a0006 with 2^22 / 2^29, 0 of 2 with 2^18 / 2^26); the title's widest
+    // real dispatch seen is 115,200 groups
+    uint max_groups = (kind >> 31) != 0 ? (1u << 18) : MAX_GROUPS;
     if (k <= 1) {
         a.x = min(a.x, MAX_VERTICES);
         a.y = min(a.y, MAX_VERTEX_INSTANCES / max(a.x, 1u));
@@ -61,8 +66,8 @@ uint clamp_args(inout uint3 a) {
         a.x = fold;
     }
     a = min(a, uint3(MAX_GROUPS_DIM, MAX_GROUPS_DIM, MAX_GROUPS_DIM));
-    a.y = min(a.y, MAX_GROUPS / max(a.x, 1u));
-    a.z = min(a.z, MAX_GROUPS / max(a.x * a.y, 1u));
+    a.y = min(a.y, max_groups / max(a.x, 1u));
+    a.z = min(a.z, max_groups / max(a.x * a.y, 1u));
     return a.x * a.y * a.z * (k == 3 ? 128u : 64u);
 }
 
