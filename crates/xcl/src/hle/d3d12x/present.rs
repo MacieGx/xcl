@@ -814,7 +814,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        // lab: an rt dump waits longer - with a frame of 2-3 s the copies were not done in 2 s and the set was lost (run O8)
+        let limit = if p.dumps.iter().any(|d| d.tag.starts_with("rtd_")) { 30000 } else { 2000 };
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), limit) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("target") {
