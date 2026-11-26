@@ -700,11 +700,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     // (#1798: a graphics pipeline still being built is not waited for; a compute one is)
     let pso = pso_for_draw(raw_pso);
+    // (any other ExecuteIndirect ends a run of two-pass ones: a dispatch may write their records)
+    if super::clamp_runs::on() && !(super::real::two_pass_of(pso).is_some() && dispatch_mesh_sig_of(sig).is_some()) {
+        super::clamp_runs::write(this as usize);
+    }
     let (console_args_off, console_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+            super::clamp_runs::call(this as usize);
             // the records bounded on the GPU first, as for other ExecuteIndirect calls below: a
             // garbage record hung the GPU here (0x887a0006). Both passes read the bounded copy.
             // The compute pass writes one record per group into `res` (a root UAV: no bounds
@@ -2457,6 +2462,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     dispatch_probe(this, pso, [x, y, z]);
+    super::clamp_runs::write(this as usize);
     rt_dump_note_compute(this);
     let twins = depth_twins_named(this);
     for &(res, plane) in &twins {
