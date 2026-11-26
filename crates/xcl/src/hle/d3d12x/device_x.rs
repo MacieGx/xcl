@@ -931,14 +931,11 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             if pc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || *OFF.get_or_init(|| std::env::var("XCL_VOLUME_BYTES").is_ok_and(|v| v.trim() == "0")) {
                 return None;
             }
-            let texel: u64 = match pc.Format.0 {
-                1..=4 => 16,
-                9..=14 => 8,
-                48..=59 => 2,
-                60..=65 => 1,
-                _ => 4,
-            };
-            let mip0 = pc.Width * pc.Height as u64 * pc.DepthOrArraySize as u64 * texel;
+            // (xg's element sizes: block formats count by 4x4 blocks - the first form here took every
+            // unknown format as 4 bytes a texel, 8x too much for a BC1 volume; CharlyRien's note)
+            let (log2_bytes, side) = crate::hle::xg::element(pc.Format.0 as u32).unwrap_or((2, 1));
+            let (side, bytes) = (side as u64, 1u64 << log2_bytes);
+            let mip0 = pc.Width.div_ceil(side) * (pc.Height as u64).div_ceil(side) * pc.DepthOrArraySize as u64 * bytes;
             let bytes = if pc.MipLevels > 1 { mip0 + mip0 / 7 } else { mip0 };
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 24 {
