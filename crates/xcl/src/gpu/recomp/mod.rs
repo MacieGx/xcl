@@ -60,6 +60,7 @@ pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
+pub mod mesh_native;
 pub mod mesh_wave;
 pub mod partition;
 pub mod x64_masks;
