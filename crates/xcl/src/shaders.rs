@@ -1676,6 +1676,10 @@ pub(crate) struct LaunchPreparation {
     /// The worker processes building compute pipelines (0: none; `done` and `total` then count
     /// the records translated here, with them the records the workers have passed).
     pub workers: AtomicUsize,
+    /// The shaders earlier runs used (`pso_async::earlier_used_shaders`), when there are any:
+    /// only their records are translated before the title starts, and it translates another
+    /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
+    pub only: Option<HashSet<u64>>,
 }
 
 /// Unpacked shader containers in the title's shaders directory. Do not follow directory
@@ -1939,6 +1943,11 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                 // `--sample N`: the first N programs `--only` lets through
                 if taken.fetch_add(1, Ordering::Relaxed) >= sample {
                     break;
+                }
+                if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
+                    unused.fetch_add(1, Ordering::Relaxed);
+                    record_done();
+                    continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again; an MS
