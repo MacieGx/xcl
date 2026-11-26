@@ -295,6 +295,9 @@ struct State {
     parked: FxHashMap<usize, (u32, u32)>,
     /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
     quarantined: VecDeque<RetiredTiles>,
+    /// lab (`XCL_SPARSE_COOL=1`): pool tiles a buffer gave back (`release_if_unused`), quarantined
+    /// with the parked ones at the next flush instead of free at once
+    released: Vec<(u32, u32)>,
     /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
     queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// tile address → pool tile of decommitted tiles a placed buffer uses: they stay mapped in
@@ -538,6 +541,15 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// lab: `XCL_SPARSE_COOL=1`: a pool tile a buffer gives back is used again only after the work
+/// submitted before on the sparse queue and every known title queue is done (the quarantine of
+/// parked tiles, #2345), not at once. nvidia-dev's cooldown (`9554f33e`, `76969bc1`: freed tiles
+/// wait 2 s) covered every freed tile; here the parked ones have the quarantine already.
+fn sparse_cool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_COOL").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// One copy back at a time (`readback_released`): the readback buffer and its list are in use
 /// until the copy is done, and that is waited for with `STATE` released. Taken before `STATE`,
 /// never under it.
@@ -779,6 +791,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         parked: FxHashMap::default(),
         kept: FxHashMap::default(),
         quarantined: VecDeque::new(),
+        released: Vec::new(),
         queue_fences: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
@@ -2123,7 +2136,13 @@ impl State {
 
     /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
     /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    /// lab: with `XCL_SPARSE_COOL=1` it is quarantined at the next flush (`released`) instead.
     fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
+        self.release_if_unused_as(t, tile, sparse_cool());
+    }
+
+    /// `release_if_unused`, quarantined at the next flush if `cool` (`XCL_SPARSE_COOL`).
+    fn release_if_unused_as(&mut self, t: usize, tile: (u32, u32), cool: bool) {
         if self.pinned.contains_key(&tile) {
             return;
         }
@@ -2133,7 +2152,11 @@ impl State {
             return;
         }
         if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) && !self.quarantined.iter().any(|b| b.tiles.contains(&tile)) {
-            self.free.push(tile);
+            if !cool {
+                self.free.push(tile);
+            } else if !self.released.contains(&tile) {
+                self.released.push(tile);
+            }
         }
     }
 
@@ -2215,10 +2238,15 @@ impl State {
     /// they take a tile right away.
     unsafe fn flush_parked(&mut self) -> bool {
         if self.parked.is_empty() {
+            // lab (`XCL_SPARSE_COOL=1`): tiles buffers gave back, behind the same fences
+            if !self.released.is_empty() {
+                let tiles = std::mem::take(&mut self.released);
+                self.quarantine_tiles(tiles);
+            }
             return false;
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-        let mut tiles: Vec<(u32, u32)> = Vec::new();
+        let mut tiles: Vec<(u32, u32)> = std::mem::take(&mut self.released);
         for (t, tile) in std::mem::take(&mut self.parked) {
             // (a placed buffer uses it)
             if self.pinned.contains_key(&tile) {
@@ -2805,6 +2833,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2989,6 +3018,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3204,6 +3234,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3311,6 +3342,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3474,6 +3506,52 @@ mod tests {
             s.wait_for(s.value);
             assert!(s.drain_quarantined(), "completed unmap batch should drain after fence completion");
             assert!(s.free.contains(&tile), "unmapped tile must return to free list once unmap fence completes");
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// lab (`XCL_SPARSE_COOL=1`): a pool tile a buffer gives back is not free at once: it is
+    /// quarantined at the next flush, behind the work submitted before, as parked tiles are.
+    #[test]
+    fn a_tile_a_buffer_gives_back_is_quarantined_with_the_cool_switch() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            // a tile only a buffer used (its window maps another one at the address)
+            let tile = s.mapped[&base].pool;
+            let other = (tile.0, tile.1 + 1);
+            s.free.retain(|&t| t != other);
+            s.release_if_unused_as(base, other, false);
+            assert!(s.free.contains(&other), "without the switch: free at once");
+            s.free.retain(|&t| t != other);
+
+            // a title queue whose work submitted before is still running
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            assert!(s.note_queue(&title_q));
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            title_q.Wait(&gate, 1).expect("gate title queue");
+            s.release_if_unused_as(base, other, true);
+            s.release_if_unused_as(base, other, true);
+            assert_eq!(s.released, vec![other], "once");
+            assert!(!s.free.contains(&other));
+            assert!(!s.flush_parked(), "nothing parked to unmap");
+            assert!(s.released.is_empty());
+            assert!(!s.drain_quarantined(), "the title queue is held: still quarantined");
+            assert!(!s.free.contains(&other));
+            gate.Signal(1).expect("release title queue");
+            let t0 = std::time::Instant::now();
+            while !s.drain_quarantined() {
+                assert!(t0.elapsed().as_secs() < 5, "the title queue went on");
+                std::thread::yield_now();
+            }
+            assert!(s.free.contains(&other), "free once the work before is done");
             drop(_unblock);
             s.wait_for(s.value);
             drop(s);
