@@ -999,14 +999,15 @@ struct SymbolInfoW {
 
 /// Lab (`XCL_SAMPLE=<from s>,<seconds>[,<ms>]`, `XCL_SAMPLE_FILE=<path>`): a sampling profile of
 /// the whole process without a debugger or ETW. Every `ms` (10) each thread is stopped for its
-/// registers, as `dump_threads` does, and its stack is unwound after it runs again (the leaf is
-/// exact; callers of a running thread can be off). At the end the file gets each thread's CPU time
+/// registers and the top of its stack; the leaf is exact, the callers are the stack words that
+/// follow a call instruction (frames, and now and then a stale one). At the end the file gets each thread's CPU time
 /// in the window (`GetThreadTimes`) and the stacks by count, outermost first, with names from
 /// the symbols (`<thread>;<frame>;...;<leaf> <samples>`).
 pub fn sample_profile(from: f64, seconds: f64, every_ms: u64, file: std::path::PathBuf) {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadTimes, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
     };
@@ -1044,6 +1045,29 @@ pub fn sample_profile(from: f64, seconds: f64, every_ms: u64, file: std::path::P
             (v(k), v(u))
         };
         // tid -> (handle, name, kernel and user time at its first sample)
+        const STACK_WORDS: usize = 384;
+        // address -> whether it follows a call instruction in committed executable memory
+        let mut code: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+        let after_call = |a: usize, code: &mut std::collections::HashMap<usize, bool>| -> bool {
+            if let Some(&k) = code.get(&a) {
+                return k;
+            }
+            let mut q: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let exec = VirtualQuery(a as *const c_void, &mut q, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0
+                && q.State == MEM_COMMIT
+                && q.Protect & 0xF0 != 0
+                && q.Protect & 0x100 == 0
+                && a - (q.BaseAddress as usize) >= 7;
+            let k = exec && {
+                let b = std::slice::from_raw_parts((a - 7) as *const u8, 7);
+                // call rel32; call r/m64 (FF /2) with no, an 8-bit or a 32-bit displacement
+                b[2] == 0xE8 || (b[5] == 0xFF && b[6] & 0x38 == 0x10) || (b[4] == 0xFF && b[5] & 0x38 == 0x10) || (b[1] == 0xFF && b[2] & 0x38 == 0x10) || (b[0] == 0xFF && b[1] & 0x38 == 0x10)
+            };
+            if code.len() < 1 << 20 {
+                code.insert(a, k);
+            }
+            k
+        };
         let mut known: std::collections::HashMap<u32, (usize, String, (u64, u64))> = std::collections::HashMap::new();
         let mut stacks: std::collections::HashMap<(u32, Vec<usize>), u32> = std::collections::HashMap::new();
         let t0 = std::time::Instant::now();
@@ -1071,13 +1095,39 @@ pub fn sample_profile(from: f64, seconds: f64, every_ms: u64, file: std::path::P
                 struct Aligned(CONTEXT);
                 let mut c: Aligned = std::mem::zeroed();
                 c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+                // While the thread stands: its registers and the top of its stack, copied (no lock,
+                // no heap). Unwinding a thread that runs again read a frame that was gone and
+                // faulted in RtlVirtualUnwind (run J1); unwinding it while it stands can wait for a
+                // lock it holds. So the callers are the words of the copy that follow a call
+                // instruction in some module: the frames, and now and then a stale one.
+                let mut words = [0u64; STACK_WORDS];
+                let mut have = 0usize;
                 let got = SuspendThread(h) != u32::MAX && {
                     let ok = GetThreadContext(h, &mut c.0) != 0;
+                    if ok {
+                        let sp = c.0.Rsp as usize & !7;
+                        let mut q: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                        if sp != 0 && VirtualQuery(sp as *const c_void, &mut q, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0 && q.State == MEM_COMMIT && q.Protect & 0x104 == 0x4 {
+                            let end = q.BaseAddress as usize + q.RegionSize;
+                            have = ((end - sp) / 8).min(STACK_WORDS);
+                            std::ptr::copy_nonoverlapping(sp as *const u64, words.as_mut_ptr(), have);
+                        }
+                    }
                     ResumeThread(h);
                     ok
                 };
                 if got {
-                    *stacks.entry((tid, unwind(&mut c.0, 28))).or_insert(0) += 1;
+                    let mut frames = vec![c.0.Rip as usize];
+                    for &w in &words[..have] {
+                        let a = w as usize;
+                        if frames.len() >= 24 {
+                            break;
+                        }
+                        if a > 0x10000 && frames.last() != Some(&a) && after_call(a, &mut code) {
+                            frames.push(a);
+                        }
+                    }
+                    *stacks.entry((tid, frames)).or_insert(0) += 1;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(every_ms));
