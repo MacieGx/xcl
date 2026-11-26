@@ -746,6 +746,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
+    // lab: `XCL_GPU_TIME` – the timestamp queries of the frame's dispatches
+    super::bind::gpu_time_present(&p.list);
     // lab: `XCL_RT_DUMP` – what the title wrote this frame
     if let Some(set) = rt_dump_take() {
         let n = PRESENTS.load(Ordering::Relaxed);

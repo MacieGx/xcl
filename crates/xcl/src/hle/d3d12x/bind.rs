@@ -907,6 +907,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if compute && !gfx {
         pass_fill_at(this, pso, true);
     }
+    let timed = if compute && !gfx { gpu_time_begin(this, pso) } else { None };
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
@@ -918,6 +919,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         for (res, plane) in twins {
             super::list_x::depth_twin_flush(this, res, plane);
         }
+        gpu_time_end(this, timed);
         if compute && !gfx {
             pass_snap(this, pso);
             pass_fill(this, pso);
@@ -2391,8 +2393,10 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         super::list_x::depth_twin_fill(this, res, plane);
     }
     pass_fill_at(this, pso, true);
+    let timed = gpu_time_begin(this, pso);
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
+    gpu_time_end(this, timed);
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);
     }
@@ -2464,6 +2468,124 @@ unsafe fn pass_fill_at(this: *mut c_void, pso: usize, before: bool) {
         if n <= 24 || n.is_power_of_two() {
             crate::xlog_info!("pass {}fill #{n}: cs {cs:016x} t{ti}[{k}] {:#x} with {pat:#010x} at {:.1} s: {}", if before { "pre" } else { "" }, r.unwrap_or(0), crate::log::uptime(), if done { "done" } else { "NOT done" });
         }
+    }
+}
+
+/// lab: `XCL_GPU_TIME=<seconds>` - GPU time by compute program. From that time, for 2.5 s (12000
+/// calls at most), a timestamp query before and after each translated dispatch / indirect dispatch of
+/// the title's lists; the present after that resolves them (`gpu_time_present`, on the presenter's
+/// list) and one 4 s later prints the sums by program: "gpu time: ...". Ticks of the queue's
+/// timestamp counter; passes on several queues overlap, so the shares are a guide, not a budget.
+struct GpuTime {
+    heap: ID3D12QueryHeap,
+    rb: ID3D12Resource,
+    /// the program of each pair
+    meta: Vec<u64>,
+    /// 0 collecting, 1 resolved (at `at`), 2 printed
+    state: u8,
+    at: f64,
+}
+static GPU_TIME: Mutex<Option<GpuTime>> = Mutex::new(None);
+const GPU_TIME_PAIRS: usize = 12000;
+
+fn gpu_time_from() -> Option<f64> {
+    static FROM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| std::env::var("XCL_GPU_TIME").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The pair's index when this call is timed (the first query is recorded).
+unsafe fn gpu_time_begin(this: *mut c_void, pso: usize) -> Option<u32> {
+    let from = gpu_time_from()?;
+    let now = crate::log::uptime();
+    if now < from || now > from + 2.5 {
+        return None;
+    }
+    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?;
+    let mut g = GPU_TIME.lock().unwrap();
+    if g.is_none() {
+        let dev = super::real::list_device(this)?;
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2 * GPU_TIME_PAIRS as u32, NodeMask: 0 }, &mut heap).ok()?;
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 16 * GPU_TIME_PAIRS as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .ok()?;
+        *g = Some(GpuTime { heap: heap?, rb: rb?, meta: Vec::new(), state: 0, at: 0.0 });
+    }
+    let t = g.as_mut()?;
+    if t.state != 0 || t.meta.len() >= GPU_TIME_PAIRS {
+        return None;
+    }
+    let i = t.meta.len() as u32;
+    t.meta.push(super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0));
+    list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i);
+    Some(i)
+}
+
+unsafe fn gpu_time_end(this: *mut c_void, i: Option<u32>) {
+    let Some(i) = i else { return };
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if let Some(t) = GPU_TIME.lock().unwrap().as_ref() {
+        list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i + 1);
+    }
+}
+
+/// At a present (the presenter's list, recorded after the frame's lists were submitted).
+pub(super) unsafe fn gpu_time_present(list: &ID3D12GraphicsCommandList) {
+    let Some(from) = gpu_time_from() else { return };
+    let now = crate::log::uptime();
+    let mut g = GPU_TIME.lock().unwrap();
+    let Some(t) = g.as_mut() else { return };
+    if t.state == 0 && !t.meta.is_empty() && now > from + 3.5 {
+        list.ResolveQueryData(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * t.meta.len() as u32, &t.rb, 0);
+        t.state = 1;
+        t.at = now;
+    } else if t.state == 1 && now > t.at + 4.0 {
+        t.state = 2;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if t.rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+            return;
+        }
+        let q = |k: usize| (p as *const u64).add(k).read_unaligned();
+        let mut by: HashMap<u64, (u64, u32)> = HashMap::new();
+        let (mut total, mut bad, mut first, mut last) = (0u64, 0u32, u64::MAX, 0u64);
+        for (i, &cs) in t.meta.iter().enumerate() {
+            let (a, b) = (q(2 * i), q(2 * i + 1));
+            if a == 0 || b < a {
+                bad += 1;
+                continue;
+            }
+            let e = by.entry(cs).or_default();
+            e.0 += b - a;
+            e.1 += 1;
+            total += b - a;
+            first = first.min(a);
+            last = last.max(b);
+        }
+        t.rb.Unmap(0, None);
+        let mut v: Vec<_> = by.into_iter().collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
+        crate::xlog_info!(
+            "gpu time: {} calls timed from {from:.1} s ({bad} without a result), {total} ticks in them, {} ticks from the first to the last; by program (ticks, share, calls): {}",
+            t.meta.len(),
+            last.saturating_sub(first.min(last)),
+            v.iter().take(40).map(|(cs, (ticks, n))| format!("{cs:016x} {ticks} {:.1}% {n}", 100.0 * *ticks as f64 / total.max(1) as f64)).collect::<Vec<_>>().join("; ")
+        );
     }
 }
 
