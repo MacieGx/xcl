@@ -2577,6 +2577,18 @@ pub(super) unsafe fn gpu_time_present(list: &ID3D12GraphicsCommandList) {
             first = first.min(a);
             last = last.max(b);
         }
+        // the time BETWEEN the timed calls, in the order the GPU ran them: the largest gaps and the
+        // programs on either side (what lies there - draws, copies, waits - is the rest of the frame)
+        let mut line: Vec<(u64, u64, u64)> = t.meta.iter().enumerate().map(|(i, &cs)| (q(2 * i), q(2 * i + 1), cs)).filter(|&(a, b, _)| a != 0 && b >= a).collect();
+        line.sort_unstable();
+        let mut gaps: Vec<(u64, u64, u64)> = line.windows(2).filter(|w| w[1].0 > w[0].1).map(|w| (w[1].0 - w[0].1, w[0].2, w[1].2)).collect();
+        gaps.sort_unstable_by_key(|g| std::cmp::Reverse(g.0));
+        let between: u64 = gaps.iter().map(|g| g.0).sum();
+        crate::xlog_info!(
+            "gpu time gaps: {between} ticks between the timed calls in {} gaps; the largest (ticks, after program, before program): {}",
+            gaps.len(),
+            gaps.iter().take(30).map(|(n, a, b)| format!("{n} {a:016x} {b:016x}")).collect::<Vec<_>>().join("; ")
+        );
         t.rb.Unmap(0, None);
         let mut v: Vec<_> = by.into_iter().collect();
         v.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
