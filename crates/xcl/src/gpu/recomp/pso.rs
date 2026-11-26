@@ -156,6 +156,8 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // lab (`XCL_FOLD_GROUPS`): a program with a folded group id is another output, so another key
     let fold = stage == Stage::Compute && crate::gpu::dxil::kernel::fold_groups(crate::gpu::shader::fnv64(blob));
     let windows = if fold { windows | crate::gpu::dxil::kernel::FOLD_GROUPS } else { windows };
+    // lab (`XCL_DIRECT_FOR`): a program sent to the direct translator is another output too
+    let windows = if stage == Stage::Compute && direct_for(crate::gpu::shader::fnv64(blob)) { windows | DIRECT_FOR } else { windows };
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
@@ -611,8 +613,17 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    // lab (`XCL_DIRECT_FOR`): this compute program through the direct translator, whatever its size
+    let forced = stage == Stage::Compute && windows & DIRECT_FOR != 0;
+    let windows = windows & !DIRECT_FOR;
     // lab (`XCL_FOLD_GROUPS`): only the direct translator folds the group id – it or nothing
     let (windows, direct_windows) = (windows & !crate::gpu::dxil::kernel::FOLD_GROUPS, windows);
+    if forced && direct_windows & crate::gpu::dxil::kernel::FOLD_GROUPS == 0 {
+        defer_direct_compute()?;
+        let c = direct_compute(blob, sampler_base, windows, split_wave64).map_err(|e| format!("XCL_DIRECT_FOR: no direct translation: {}", e.lines().next().unwrap_or("")))?;
+        crate::xlog_info!("[SHADER] lab: compute program {:016x} through the direct translator ({} B)", crate::gpu::shader::fnv64(blob), c.dxil.len());
+        return Ok((c, false));
+    }
     if stage == Stage::Compute && direct_windows & crate::gpu::dxil::kernel::FOLD_GROUPS != 0 {
         defer_direct_compute()?;
         let c = direct_compute(blob, sampler_base, direct_windows, split_wave64).map_err(|e| format!("XCL_FOLD_GROUPS: no direct translation: {}", e.lines().next().unwrap_or("")))?;
@@ -1007,6 +1018,24 @@ fn defer_direct_compute() -> Result<(), String> {
         return Err("DXIL not compiled yet".into());
     }
     Ok(())
+}
+
+/// Lab: in the window count of a translation request, as `kernel::FOLD_GROUPS` is: the program is
+/// one of `XCL_DIRECT_FOR` (its own cache entries; the bit never reaches a translator).
+const DIRECT_FOR: u32 = 0x2000;
+
+/// Lab (`XCL_DIRECT_FOR=<cs record hash>,...`): compute programs that take the direct DXIL
+/// translator whatever their size. For a program the HLSL path gets wrong and the direct one
+/// right - the retail title's hair rasteriser (`smh_draw_*:CS_VisHair`) keeps its nearest strand
+/// with a 64-bit `image_atomic_umax`, which the HLSL path wrote as a 32-bit one of the low word
+/// - without changing the translators' sources (so without a precompile of everything else).
+fn direct_for(record: u64) -> bool {
+    static SET: OnceLock<Vec<u64>> = OnceLock::new();
+    SET.get_or_init(|| direct_for_from(&std::env::var("XCL_DIRECT_FOR").unwrap_or_default())).contains(&record)
+}
+
+fn direct_for_from(v: &str) -> Vec<u64> {
+    v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()
 }
 
 pub fn huge_direct_min() -> Option<usize> {
@@ -1647,6 +1676,14 @@ mod shader_cache_tests {
         assert_eq!(huge_direct_min_from(Some("0")), None);
         assert_eq!(huge_direct_min_from(Some(" 200 ")), Some(200 << 10));
         assert_eq!(huge_direct_min_from(Some("junk")), Some(HUGE_DIRECT_MIN_DEFAULT));
+    }
+
+    #[test]
+    fn direct_for_names_records_and_keeps_clear_of_the_window_count() {
+        assert_eq!(direct_for_from("ffb04c9d76197115, 70c40f1c8dedfdf0,,junk"), vec![0xffb0_4c9d_7619_7115, 0x70c4_0f1c_8ded_fdf0]);
+        assert!(direct_for_from("").is_empty());
+        // the bit is none of the window count's, the heap flag's or the fold flag's
+        assert_eq!(DIRECT_FOR & (crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::dxil::kernel::FOLD_GROUPS | 0xFF), 0);
     }
 
     #[test]
