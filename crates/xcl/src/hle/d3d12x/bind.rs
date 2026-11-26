@@ -540,6 +540,73 @@ unsafe fn bind_two_pass_stage(
     Ok(())
 }
 
+/// `XCL_NATIVE_MESH`: the bindings of a pipeline whose mesh shader is the console program
+/// itself (`TwoPassPso::native`). The mesh program and the pixel shader take different user
+/// SGPRs (`console_list::user_data_ms` / `user_data_gfx`) and one root signature has one `io`:
+/// the pixel shader's block first, as in any draw, then the mesh program's
+/// (`recomp::MeshNative::io_base`). `res` is not used (window 0 stands in).
+unsafe fn bind_native_mesh(this: *mut c_void, list: &ID3D12GraphicsCommandList, real_mesh_pso: usize, tp: &super::real::TwoPassPso) -> Result<(), String> {
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let windows = super::real::uma_window_vas();
+    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let copy = |bytes: &[u8]| -> Result<usize, String> {
+        let p = with(this, |s| s.arena.take_or(u, bytes.len().max(16), 256, &mut s.uma, super::sparse::arena_block)).ok_or("unified memory is full")?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        Ok(p as usize)
+    };
+    // lab: what the program reads of the title's memory outside the unified windows
+    super::view_mem::ensure_for_draw(layout.as_deref(), &args);
+    let mut io = Vec::with_capacity(2 * crate::gpu::recomp::KERNEL_SGPRS);
+    for mesh in [false, true] {
+        let inline = layout.as_ref().map_or(0, |l| if mesh { l.inline_ms } else { l.inline_gfx } as usize).min(args.len());
+        let table_at = copy(&args[inline..])?;
+        let mut block = match layout.as_ref() {
+            Some(l) if mesh => console_list::user_data_ms(l, &args, table_at as u64),
+            Some(l) => console_list::user_data_gfx(l, &args, table_at as u64),
+            None if mesh => {
+                let mut v = vec![0u32; 16];
+                v[8] = table_at as u32;
+                v[9] = (table_at >> 32) as u32;
+                v
+            }
+            None => vec![table_at as u32, (table_at >> 32) as u32],
+        };
+        let user = block.len();
+        heap_sgpr(this, &mut block, layout.is_some());
+        if !mesh {
+            ps_probe(tp, &block);
+            if block.len() > user {
+                draw_textures(&block, user);
+            }
+        }
+        block.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+        block[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+        io.extend(block);
+    }
+    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+    let rs_raw = tp.mesh_rs as *mut c_void;
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("native mesh root signature")?;
+    list.SetGraphicsRootSignature(rs);
+    let views = [super::real::uma_va_of(io_at).unwrap_or(first), first].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    for (k, v) in views.enumerate() {
+        list.SetGraphicsRootUnorderedAccessView(k as u32, v);
+    }
+    let pso_raw = real_mesh_pso as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("native mesh pipeline")?;
+    list.SetPipelineState(pc);
+    Ok(())
+}
+
+/// Native mesh draws so far (direct, indirect), logged at powers of two.
+fn native_mesh_drawn(indirect: bool, groups: u32) {
+    static N: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let n = N[indirect as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: native mesh {} #{n} ({groups} {})", if indirect { "ExecuteIndirect(DispatchMesh)" } else { "DispatchMesh" }, if indirect { "records at most" } else { "groups" });
+    }
+}
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     let key = dev.as_raw() as usize;
@@ -627,6 +694,26 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             return;
         }
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+        if tp.native {
+            // `XCL_NATIVE_MESH`: the console program is the pipeline's mesh shader – one draw
+            match bind_native_mesh(this, list, pso, &tp) {
+                Ok(()) => {
+                    pc_dm(this, groups.min(65535), 1, 1);
+                    super::targets::note_draw(this, super::targets::RAN);
+                    count(DRAWS);
+                    native_mesh_drawn(false, groups);
+                }
+                Err(e) => {
+                    super::targets::note_draw(this, super::targets::SKIPPED);
+                    count(DRAWS_SKIPPED);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::xlog_warn!("D3D12.X: native mesh DispatchMesh skipped: {e}");
+                    }
+                }
+            }
+            return;
+        }
         // one record per group into `res` (a root UAV: no bounds check), whose size
         // `ensure_res_buffer` caps at 128 MiB: groups past it would write past the buffer
         let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
@@ -734,6 +821,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let RES_BYTES: u64 = *RES_MB.get_or_init(|| std::env::var("XCL_TWO_PASS_RES_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32u64).clamp(1, 128)) << 20;
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
             let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::budget())) as u32;
+            // (`XCL_NATIVE_MESH`: no record buffer to fit, the budget of any other call)
+            let budget = if tp.native { super::indirect_clamp::budget() } else { budget };
             ei_peek(this, 3, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             // lab: `XCL_TWO_PASS_UNBOUNDED=1`: the passes read the title's records as they are
             static UNBOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -798,6 +887,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             let run = (|| -> Result<(), String> {
+                if tp.native {
+                    // `XCL_NATIVE_MESH`: the console program is the pipeline's mesh shader – the
+                    // title's call on the bounded records, nothing before or after it
+                    bind_native_mesh(this, list, pso, &tp)?;
+                    fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+                    native_mesh_drawn(true, max);
+                    return Ok(());
+                }
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES.max(cpu_need))?;
                 ms_probe(this, "EI", &tp, max);
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;

@@ -753,6 +753,16 @@ impl Em {
         }
     }
 
+    /// Mesh mode: dword `n` of this thread's vertex – in the group's record, or in the
+    /// thread's own copy of it when the program is the mesh shader itself.
+    fn mesh_vertex_store(&self, n: usize, v: &str) -> String {
+        if self.opt.mesh_native.is_some() {
+            format!("xcl_v[{n}] = {v};")
+        } else {
+            format!("res.Store((xcl_vtx + {n}u) * 4u, {v});")
+        }
+    }
+
     fn act(&self) -> &'static str {
         // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
         if self.opt.wave64 {
@@ -1308,6 +1318,9 @@ impl Em {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
                     self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
+                } else if self.opt.mesh_native.is_some() && matches!(self.opt.mode, Mode::Mesh(_)) {
+                    // native mesh shader: no LDS (refused), so nothing to wait for – and the
+                    // title's barriers sit in code only some threads reach
                 } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
                     if self.safe_barrier {
                         self.line("xcl_s_barrier();");
@@ -1342,7 +1355,9 @@ impl Em {
             }
             "s_sendmsg" if matches!(self.opt.mode, Mode::Mesh(_)) => {
                 // GS_ALLOC_REQ: M0 = primitives << 12 | vertices (scalar: whatever EXEC is)
-                if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 {
+                if self.opt.mesh_native.is_some() {
+                    // native: the declared maxima are the counts (`mesh_native_io`)
+                } else if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 {
                     let m0 = self.sreg(124);
                     self.line(&format!(
                         "if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, {m0} & 0x3FFu); res.Store(xcl_rec * 4u + 4u, ({m0} >> 12) & 0x7FFu); }}"
@@ -2409,7 +2424,7 @@ impl Em {
             (Mode::Mesh(_), 12) => {
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!("res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
+                        st.push(self.mesh_vertex_store(c, &Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -2430,11 +2445,12 @@ impl Em {
                         if dw < 4 && enabled(dw) {
                             let v = Self::exp_comp(srcs, compr, dw);
                             let v = if f16 { format!("asuint(f16tof32({v} >> {}u))", 16 * (c & 1)) } else { v };
-                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
+                            st.push(self.mesh_vertex_store(4 * (j + 1) + c, &v));
                         }
                     }
                 }
             }
+            (Mode::Mesh(_), 20) if self.opt.mesh_native.is_some() => st.push(format!("xcl_p = {};", srcs[0])),
             (Mode::Mesh(_), 20) => st.push(format!("res.Store(xcl_prm * 4u, {});", srcs[0])),
             (Mode::Mesh(_), 9) => {}
             _ => return Err("export target"),
@@ -4101,6 +4117,18 @@ impl Em {
                 "({c} & ~(0xFFu << (8u * ({b} & 3u)))) | (((uint)clamp(round({}), 0.0f, 255.0f)) << (8u * ({b} & 3u)))",
                 fs(0)
             ),
+            // native mesh shader: the lane-index idiom (a mask of all ones) counts the console's
+            // lanes, which are not the hardware wave's; a count over any other mask is refused
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" if self.opt.mesh_native.is_some() => {
+                if rdna2::field_value(d.enc, &d.words, "SRC0") != Some(193) {
+                    return Err("prefix count over a mask in a native mesh shader");
+                }
+                if name == "v_mbcnt_lo_u32_b32" {
+                    format!("min(xcl_cl, 32u) + {b}")
+                } else {
+                    format!("(max(xcl_cl, 32u) - 32u) + {b}")
+                }
+            }
             "v_mbcnt_lo_u32_b32" => format!("countbits({a} & lanemask_lt_lo()) + {b}"),
             "v_mbcnt_hi_u32_b32" => format!("countbits({a} & lanemask_lt_hi()) + {b}"),
             "v_cndmask_b32" => {
@@ -4945,12 +4973,14 @@ impl Em {
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
+        // (a native mesh shader's block is not the first of `io`: `MeshNative::io_base`)
+        let io_base = self.opt.mesh_native.as_ref().map_or(0, |n| n.io_base as usize);
         let load_sgprs = |h: &mut String| {
             if windows > 1 {
-                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", (io_base + super::IO_UMA_BASE_HI) * 4);
             }
             for &c in &sg {
-                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), (io_base + c as usize) * 4);
             }
         };
         match &self.opt.mode {
@@ -5112,6 +5142,35 @@ impl Em {
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_exit();\n");
                 }
+                h.push_str("}\n");
+            }
+            Mode::Mesh(ms) if self.opt.mesh_native.is_some() => {
+                // The program as the mesh shader itself. D3D12 has no `WaveSize` for a mesh
+                // shader, so nothing here depends on the hardware wave: the console's thread
+                // is SV_GroupIndex (wave = thread / 64, lane = thread % 64), EXEC and VCC are
+                // ballots of whatever wave the driver made (as in a VS / PS), and each thread
+                // keeps its vertex and primitive (`xcl_v`, `xcl_p`) until the end.
+                let native = self.opt.mesh_native.clone().unwrap_or_default();
+                let (decl, epilogue) = mesh_native_io(ms, native.ps_inputs.as_deref(), native.mirror);
+                h.push_str(&decl);
+                let (t, mv, mp) = (ms.threads, ms.max_vertices, ms.max_primitives);
+                let _ = writeln!(h, "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{");
+                // one call that dominates every output write, the same in every thread: the
+                // declared maxima; a slot nothing exports to stays a null primitive
+                let _ = writeln!(h, "    SetMeshOutputCounts({mv}u, {mp}u);");
+                h.push_str("    lane_id = WaveGetLaneIndex();\n    uint xcl_cl = gi & 63u;\n    uint xcl_wave = gi >> 6;\n");
+                let _ = writeln!(h, "    uint xcl_v[{}];\n    {{ for (uint k = 0u; k < {}u; k++) xcl_v[k] = 0u; }}\n    uint xcl_p = 0x80000000u;", ms.vert_dwords(), ms.vert_dwords());
+                load_sgprs(&mut h);
+                if sg.contains(&3) {
+                    h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
+                }
+                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                for &v in &self.vgprs {
+                    let init = if v == 5 { format!("gid.x * {t}u + gi") } else { "0u".into() };
+                    let _ = writeln!(h, "    uint v{v} = {init};");
+                }
+                h.push_str(body);
+                h.push_str(&epilogue);
                 h.push_str("}\n");
             }
             Mode::Mesh(ms) => {
@@ -5448,6 +5507,65 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
     h.push_str("    if (c == 1u) {\n        s.Append(v[2]);\n        s.Append(d);\n    } else {\n        s.Append(d);\n");
     h.push_str("        if (c == 0u)\n            s.Append(v[2]);\n        else\n            s.Append(v[1]);\n    }\n}\n");
     h
+}
+
+/// The outputs of a mesh program translated as the mesh shader itself (`Options::mesh_native`):
+/// the vertex declaration – that of `mesh_passthrough_for`, so the same pixel shader links –
+/// and the code that ends `main`: thread n writes vertex n and primitive n from its own copy
+/// of what the two-pass path keeps in the group's record (`xcl_v`: position + parameter
+/// dwords, `xcl_p`: the primitive word). The counts are the declared maxima, so a primitive
+/// nothing exported, a null one (bit 31) and one with an index past the vertices are
+/// degenerate, as in the pass-through.
+fn mesh_native_io(ms: &MsInterface, ps_inputs: Option<&[SigElement]>, mirror: bool) -> (String, String) {
+    let slots = ranked(&ms.outputs, true);
+    let elems: Vec<(String, &SigElement, Option<usize>)> = match ps_inputs {
+        None => slots.iter().enumerate().map(|(k, e)| (e.semantic(), *e, Some(k))).collect(),
+        Some(ins) => {
+            let mut v: Vec<(String, &SigElement, Option<usize>)> = ranked(ins, false)
+                .into_iter()
+                .map(|e| {
+                    let k = slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&e.name) && o.index == e.index);
+                    (e.semantic(), e, k)
+                })
+                .collect();
+            v.extend(slots.iter().enumerate().filter(|(_, o)| matches!(o.system_value, 2 | 3)).map(|(k, o)| (o.semantic(), *o, Some(k))));
+            v
+        }
+    };
+    let mut decl = String::from("struct XclVert {\n    float4 pos : SV_Position;\n");
+    let (mv, mp) = (ms.max_vertices, ms.max_primitives);
+    let mut end = format!("    if (gi < {mv}u) {{\n        XclVert o;\n        o.pos = asfloat(uint4(xcl_v[0], xcl_v[1], xcl_v[2], xcl_v[3]));\n");
+    for (k, (sem, e, slot)) in elems.iter().enumerate() {
+        let n = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { 4 } else { out_comps(e) };
+        let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
+        let _ = writeln!(decl, "    {ty} p{k} : {sem};");
+        let sw = ["x", "y", "z", "w"][..n].concat();
+        let raw = match slot {
+            Some(s) => {
+                let b = 4 * (s + 1);
+                format!("uint4(xcl_v[{b}], xcl_v[{}], xcl_v[{}], xcl_v[{}]).{sw}", b + 1, b + 2, b + 3)
+            }
+            None => format!("uint4(0u, 0u, 0u, 0u).{sw}"),
+        };
+        let v = match e.component_type {
+            1 => raw,
+            2 => format!("asint({raw})"),
+            _ => format!("asfloat({raw})"),
+        };
+        let _ = writeln!(end, "        o.p{k} = {v};");
+    }
+    decl.push_str("};\n");
+    end.push_str("        verts[gi] = o;\n    }\n");
+    let _ = writeln!(end, "    if (gi < {mp}u) {{");
+    end.push_str("        uint3 x = uint3(xcl_p & 0x1FFu, (xcl_p >> 10) & 0x1FFu, (xcl_p >> 20) & 0x1FFu);\n");
+    let _ = writeln!(end, "        bool bad = or((xcl_p >> 31) != 0u, any(x >= {mv}u));");
+    end.push_str("        tris[gi] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n");
+    if mirror {
+        let (vd, rec) = (ms.vert_dwords(), ms.record_dwords());
+        let _ = writeln!(end, "    if (gi < {mv}u) {{ for (uint k = 0u; k < {vd}u; k++) res.Store((gid.x * {rec}u + {MESH_HEADER}u + gi * {vd}u + k) * 4u, xcl_v[k]); }}");
+        let _ = writeln!(end, "    if (gi < {mp}u) res.Store((gid.x * {rec}u + {}u + gi) * 4u, xcl_p);", MESH_HEADER + mv as usize * vd);
+    }
+    (decl, end)
 }
 
 /// Second pass of the mesh mode: a mesh shader that turns the records written by the

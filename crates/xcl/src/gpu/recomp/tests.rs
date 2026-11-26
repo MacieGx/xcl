@@ -3641,6 +3641,292 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// The native form of a mesh program (`Options::mesh_native`: the program is the mesh shader,
+/// no compute pass, no record) against the two-pass form, on the program of
+/// `gpu_mesh_mode_two_passes`: the same pixels, and – mirrored into `res` – the same vertex and
+/// primitive dwords in every slot the two-pass header counts.
+#[test]
+fn gpu_mesh_native_draws_what_the_two_passes_draw() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MeshNative, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None),
+        // 100 vertices (both console waves, four 32-lane hardware waves), 98 primitives
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(98 << 12 | 100)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 2), ("SSRC0", 255)], Some(100)),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 2), ("VSRC1", 0)], None), // threads 0..99
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("S_MOV_B32", "ENC_SOP1", vec![("SDST", 2), ("SSRC0", 255)], Some(98)));
+    list.push(("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 2), ("VSRC1", 0)], None)); // threads 0..97
+    // primitive n = (n, n + 1, n + 2): a strip over the vertices
+    list.push(("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", 129), ("VSRC1", 0)], None));
+    list.push(("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 22), ("SRC0", 130), ("VSRC1", 0)], None));
+    list.push(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", 138), ("VSRC1", 21)], None));
+    list.push(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 22), ("SRC0", 148), ("VSRC1", 22)], None));
+    list.push(("V_OR_B32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", V + 21), ("VSRC1", 22)], None));
+    list.push(("V_OR_B32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", V), ("VSRC1", 21)], None));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    assert!(super::mesh_native::report(&code, &ms).blockers.is_empty(), "{:?}", super::mesh_native::report(&code, &ms).blockers);
+    // two passes, as the adapter runs them (64-lane waves or the split form)
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let pass = mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    // 100 vertices in a zigzag over the lower half of the target, V# in s[16:19]
+    let mut mem = vec![0u32; 0x40 + 4 * 128];
+    for i in 0..100usize {
+        let (x, y) = (-1.0 + 0.01 * i as f32, if i % 2 == 0 { -1.0 } else { 0.0 });
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(x), f(y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 100, 0]);
+    let groups = 2;
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, groups, ms.record_dwords(), &sg, &mem, 64, [-1.0; 4]).unwrap();
+    // the native form: no compute pass (an empty one keeps the runner's shape)
+    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_native: Some(MeshNative { ps_inputs: None, mirror: true, io_base: 0 }), ..Default::default() };
+    let nt = translate(&code, &nopt).unwrap();
+    assert!(nt.complete(), "{:?}", nt.unsupported_why);
+    let native = dxc::compile(&nt.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", nt.hlsl));
+    let idle = dxc::compile("[numthreads(1, 1, 1)]\nvoid main() {}\n", "main", "cs_6_6", &[]).unwrap();
+    let (npx, nrec) = runner::mesh_draw(&idle, &native, &ps, groups, ms.record_dwords(), &sg, &mem, 64, [-1.0; 4]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    for g in 0..groups as usize {
+        let (r, n) = (&rec[g * rd..(g + 1) * rd], &nrec[g * rd..(g + 1) * rd]);
+        assert_eq!((r[0], r[1]), (100, 98), "group {g}: GS_ALLOC_REQ counts");
+        for v in 0..r[0] as usize {
+            let b = MESH_HEADER + v * vd;
+            assert_eq!(r[b..b + vd], n[b..b + vd], "group {g} vertex {v}");
+        }
+        for p in 0..r[1] as usize {
+            let b = MESH_HEADER + 128 * vd + p;
+            assert_eq!(r[b], n[b], "group {g} primitive {p}");
+        }
+        // slots past the counts: nothing exported, a null primitive
+        assert_eq!(n[MESH_HEADER + 128 * vd + 99], 0x8000_0000, "group {g}: primitive slot 99");
+    }
+    let lit = px.iter().filter(|p| p[3] == 1.0).count();
+    assert!(lit > 200, "the two passes drew {lit} pixels");
+    let differ = px.iter().zip(&npx).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "pixels that differ between the two forms ({lit} drawn)");
+    // as a pipeline binds it (`bind::bind_native_mesh`): the pixel shader's SGPR block first
+    // (here words the program must not take), the mesh program's after it
+    let popt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_native: Some(MeshNative { ps_inputs: None, mirror: false, io_base: super::KERNEL_SGPRS as u32 }), ..Default::default() };
+    let pt = translate(&code, &popt).unwrap();
+    let second = dxc::compile(&pt.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let mut both = vec![0xDEAD_BEEFu32; super::KERNEL_SGPRS];
+    both.extend(&sg);
+    let (ppx, _) = runner::mesh_draw(&idle, &second, &ps, groups, ms.record_dwords(), &both, &mem, 64, [-1.0; 4]).unwrap();
+    assert_eq!(px.iter().zip(&ppx).filter(|(a, b)| a != b).count(), 0, "pixels that differ with the SGPRs in the second block");
+}
+
+/// The native mesh shader the runtime makes for a title's program (`pso::native_mesh`, as
+/// `XCL_NATIVE_MESH=1` does) is accepted by the driver in a pipeline and draws: the same pixels
+/// as the two passes on the same made-up memory. `XCL_SAMPLE_RPF`, `XCL_MESH_NAME`.
+#[test]
+fn retail_native_mesh_pipeline_draws_what_the_two_passes_draw() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough};
+    let want = std::env::var("XCL_MESH_NAME").unwrap_or_else(|_| "MS_VS_CascadeShadows_draw_f6ce4799_Wrapped".into());
+    let data = std::fs::read(path).unwrap();
+    let Some(r) = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name == want) else {
+        println!("{want}: not in the pack");
+        return;
+    };
+    let blob = crate::gpu::pack::inflate(&data, &r).unwrap();
+    let tp = super::pso::native_mesh(&blob, None, 1).unwrap().expect("a program the native form takes");
+    assert!(tp.native && tp.cs.is_empty());
+    let ms = tp.record.clone();
+    let sh = crate::gpu::xbox::parse(&blob).unwrap();
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).unwrap();
+    let p = f.programs.first().unwrap();
+    let code = &f.data[p.offset..p.offset + p.len];
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, rodata: f.rodata(p), ..Default::default() });
+    let t = translate(code, &opt).unwrap();
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let msb = dxc::compile(&mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap();
+    // every vertex of the made-up memory lands on one point, so the picture is the target's
+    // clear colour unless a form goes wrong; the position is forced onto the target instead
+    let ps = dxc::compile("float4 main(float4 pos : SV_Position) : SV_Target0 { return float4(1.0, 0.0, 0.0, 1.0); }\n", "main", "ps_6_6", &[]).unwrap();
+    const TABLE: usize = 0x1000;
+    const DATA: usize = 0x2000;
+    let mut mem = vec![0u32; 0x10000 / 4];
+    let mut z = 0x9E37_79B9u32;
+    for w in mem[DATA / 4..].iter_mut() {
+        z ^= z << 13;
+        z ^= z >> 17;
+        z ^= z << 5;
+        *w = z & 0x3FF;
+    }
+    for k in 0..(DATA - TABLE) / 16 {
+        mem[TABLE / 4 + 4 * k..TABLE / 4 + 4 * k + 4].copy_from_slice(&[DATA as u32, 1 << 16, 0xE000, 0x1101_4FAC]);
+    }
+    let groups = 4u32;
+    mem[DATA / 4] = groups;
+    for m in 0..groups as usize {
+        mem[DATA / 4 + 3 + 4 * m] = (39 + 25 * m as u32) | (29 + 29 * m as u32) << 7;
+        mem[DATA / 4 + 4 + 4 * m] = 0;
+    }
+    let mut sg = vec![0u32; 128];
+    for s in sg[8..32].iter_mut() {
+        *s = TABLE as u32;
+    }
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, groups, ms.record_dwords(), &sg, &mem, 64, [-1.0; 4]).unwrap();
+    let idle = dxc::compile("[numthreads(1, 1, 1)]\nvoid main() {}\n", "main", "cs_6_6", &[]).unwrap();
+    let mut both = vec![0xDEAD_BEEFu32; super::KERNEL_SGPRS];
+    both.extend(&sg);
+    let (npx, _) = runner::mesh_draw(&idle, &tp.ms, &ps, groups, ms.record_dwords(), &both, &mem, 64, [-1.0; 4]).unwrap();
+    let lit = px.iter().filter(|p| p[3] == 1.0).count();
+    println!("{want}: native mesh shader {} B; the two passes counted {:?} vertices / primitives in group 0 and drew {lit} pixels", tp.ms.len(), (rec[0], rec[1]));
+    assert_eq!(px.iter().zip(&npx).filter(|(a, b)| a != b).count(), 0, "pixels that differ between the two forms");
+}
+
+/// A title's mesh program in both forms on the same memory: every vertex and primitive dword
+/// the two-pass record holds within its counts is what the native form's thread kept
+/// (`MeshNative::mirror`). `XCL_SAMPLE_RPF`; `XCL_MESH_NAME` (a record's name, default one of
+/// the title's most drawn depth programs); `XCL_MESH_SGPRS=17=0x1000,19=0x8000` (user SGPRs,
+/// default: every one from s8 the address of a table whose every slot is the V# of the data).
+/// The memory is made up (meshlets of 40..117 vertices, small integers elsewhere), so this
+/// compares the forms, not the picture.
+#[test]
+fn retail_mesh_native_matches_the_two_pass_records() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MeshNative, MESH_HEADER};
+    let want = std::env::var("XCL_MESH_NAME").unwrap_or_else(|_| "MS_VS_CascadeShadows_draw_f6ce4799_Wrapped".into());
+    let data = std::fs::read(path).unwrap();
+    let Some(r) = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name == want) else {
+        println!("{want}: not in the pack");
+        return;
+    };
+    let blob = crate::gpu::pack::inflate(&data, &r).unwrap();
+    let sh = crate::gpu::xbox::parse(&blob).unwrap();
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).expect("NGG variant");
+    let Some(Mode::Mesh(ms)) = super::interface(&blob, &sh, f) else { panic!("no mesh interface") };
+    let p = f.programs.first().unwrap();
+    let code = &f.data[p.offset..p.offset + p.len];
+    let rep = super::mesh_native::report(code, &ms);
+    println!("{want}: {} B, {} threads, {} / {} vertices / primitives, {} instructions, blockers {:?}", code.len(), ms.threads, ms.max_vertices, ms.max_primitives, rep.instructions, rep.blockers);
+    // `XCL_MESH_FORCE=1`: compare a program the report refuses too (how strict its rules are)
+    assert!(rep.blockers.is_empty() || std::env::var_os("XCL_MESH_FORCE").is_some(), "not a program for the native form");
+    let wave64 = super::fssm_wave64(f, code);
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64, rodata: f.rodata(p), ..Default::default() });
+    let t = translate(code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let pass = mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let ps = dxc::compile("float4 main(float4 pos : SV_Position) : SV_Target0 { return float4(1.0, pos.z, 0.0, 1.0); }\n", "main", "ps_6_6", &[]).unwrap();
+    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64, rodata: f.rodata(p), mesh_native: Some(MeshNative { ps_inputs: None, mirror: true, io_base: 0 }), ..Default::default() };
+    let nt = translate(code, &nopt).unwrap();
+    assert!(nt.complete(), "{:?}", nt.unsupported_why);
+    if let Ok(dir) = std::env::var("XCL_MESH_HLSL_DIR") {
+        std::fs::write(std::path::Path::new(&dir).join(format!("{want}.native.hlsl")), &nt.hlsl).unwrap();
+        std::fs::write(std::path::Path::new(&dir).join(format!("{want}.twopass.hlsl")), &t.hlsl).unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    let native = dxc::compile(&nt.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    println!("native form: {} B of HLSL -> {} B of DXIL in {} ms (two-pass compute pass: {} -> {} B, split wave64: {})", nt.hlsl.len(), native.len(), t0.elapsed().as_millis(), t.hlsl.len(), cs.len(), opt.split_wave64);
+    // memory: a table at 0x1000 whose every 16 bytes are the V# of the data at 0x2000
+    const TABLE: usize = 0x1000;
+    const DATA: usize = 0x2000;
+    let mut mem = vec![0u32; 0x10000 / 4];
+    let mut z = 0x9E37_79B9u32;
+    for w in mem[DATA / 4..].iter_mut() {
+        z ^= z << 13;
+        z ^= z >> 17;
+        z ^= z << 5;
+        *w = z & 0x3FF;
+    }
+    for k in 0..(DATA - TABLE) / 16 {
+        mem[TABLE / 4 + 4 * k..TABLE / 4 + 4 * k + 4].copy_from_slice(&[DATA as u32, 1 << 16, 0xE000, 0x1101_4FAC]);
+    }
+    // the meshlet buffer as the title's programs read it: count, then 16 bytes a meshlet from 12
+    let groups = 4u32;
+    mem[DATA / 4] = groups;
+    for m in 0..groups as usize {
+        let (nv, np) = (40 + 25 * m as u32, 30 + 29 * m as u32);
+        mem[DATA / 4 + 3 + 4 * m] = (nv - 1) | (np - 1) << 7;
+        mem[DATA / 4 + 4 + 4 * m] = 0;
+    }
+    let mut sg = vec![0u32; 128];
+    for s in sg[8..32].iter_mut() {
+        *s = TABLE as u32;
+    }
+    if let Ok(list) = std::env::var("XCL_MESH_SGPRS") {
+        for kv in list.split(',') {
+            if let Some((k, v)) = kv.split_once('=') {
+                let v = v.trim();
+                sg[k.trim().parse::<usize>().unwrap()] = u32::from_str_radix(v.trim_start_matches("0x"), if v.starts_with("0x") { 16 } else { 10 }).unwrap();
+            }
+        }
+    }
+    let rd = ms.record_dwords();
+    let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, groups, rd, &sg, &mem, 64, [-1.0; 4]).unwrap();
+    let idle = dxc::compile("[numthreads(1, 1, 1)]\nvoid main() {}\n", "main", "cs_6_6", &[]).unwrap();
+    let (_, nrec) = runner::mesh_draw(&idle, &native, &ps, groups, rd, &sg, &mem, 64, [-1.0; 4]).unwrap();
+    let vd = ms.vert_dwords();
+    let (mut vertices, mut primitives, mut wrong, mut distinct) = (0usize, 0usize, Vec::new(), std::collections::BTreeSet::new());
+    for g in 0..groups as usize {
+        let (a, b) = (&rec[g * rd..(g + 1) * rd], &nrec[g * rd..(g + 1) * rd]);
+        let (nv, np) = ((a[0] as usize).min(ms.max_vertices as usize), (a[1] as usize).min(ms.max_primitives as usize));
+        println!("group {g}: the two-pass header counts {nv} vertices, {np} primitives");
+        for v in 0..nv {
+            let at = MESH_HEADER + v * vd;
+            vertices += 1;
+            distinct.insert(a[at..at + 4].to_vec());
+            if a[at..at + vd] != b[at..at + vd] && wrong.len() < 8 {
+                wrong.push(format!("group {g} vertex {v}: {:x?} / {:x?}", &a[at..at + vd], &b[at..at + vd]));
+            }
+        }
+        for q in 0..np {
+            let at = MESH_HEADER + ms.max_vertices as usize * vd + q;
+            primitives += 1;
+            distinct.insert(vec![a[at]]);
+            if a[at] != b[at] && wrong.len() < 8 {
+                wrong.push(format!("group {g} primitive {q}: {:x} / {:x}", a[at], b[at]));
+            }
+        }
+    }
+    println!("compared {vertices} vertices and {primitives} primitives ({} distinct positions and primitive words)", distinct.len());
+    assert!(vertices > groups as usize && primitives > groups as usize, "the made-up meshlets were not taken: nothing to compare");
+    assert!(wrong.is_empty(), "two-pass / native:\n{}", wrong.join("\n"));
+}
+
 /// A mesh (NGG) program whose param 0 packs two float16 registers, two components per dword
 /// (TEXCOORD1.xy in dword 0, TEXCOORD4.xyzw in dwords 1 and 2 – a retail title's transform
 /// programs): the record keeps every component as a float in its own element's slot, the

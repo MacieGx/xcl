@@ -60,6 +60,7 @@ pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
+pub mod mesh_native;
 pub mod mesh_wave;
 pub mod partition;
 pub mod x64_masks;
@@ -172,6 +173,19 @@ pub struct MsInterface {
     pub max_primitives: u32,
     /// the console's output table, as `VsInterface::params`
     pub params: Option<Vec<OutParam>>,
+}
+
+/// `Options::mesh_native`: the pixel shader's input signature the vertices are declared for
+/// (None: the program's own outputs), as `emit::mesh_passthrough_for` takes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MeshNative {
+    pub ps_inputs: Option<Vec<SigElement>>,
+    /// tests: each thread also stores its vertex and primitive where the two-pass compute
+    /// pass puts them in the group's record (`res`), so the two forms can be compared
+    pub mirror: bool,
+    /// dword of `io` the program's SGPR block starts at: in a pipeline the pixel shader's block
+    /// is at 0 (one root signature, one `io`), so the runtime puts the mesh program's after it
+    pub io_base: u32,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -640,11 +654,15 @@ pub struct Options {
     /// not hold the code, so a load at a code address in one of these ranges takes the dwords
     /// from the shader (`CODE_ADDRESS_HI`)
     pub rodata: Vec<(u32, Vec<u32>)>,
+    /// mesh mode: the program as the mesh shader itself (`emit::mesh_native_io`) instead of
+    /// the compute pass of the two-pass path. `mesh_native::report` says which programs can
+    /// take it.
+    pub mesh_native: Option<MeshNative>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new() }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new(), mesh_native: None }
     }
 }
 
