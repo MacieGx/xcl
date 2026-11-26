@@ -20,6 +20,7 @@ mod cpu_writes;
 mod depth_twin;
 pub mod dred;
 mod fence_x;
+pub(crate) mod gpu_profile;
 mod indirect_clamp;
 pub mod frame;
 pub mod guard;

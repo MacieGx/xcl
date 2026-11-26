@@ -298,10 +298,12 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     let (staging, mapped) = up.staging(dev, total)?;
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
+    crate::hle::d3d12x::gpu_profile::own_list_begin(windows::core::Interface::as_raw(&up.list));
     for (k, l, base) in &planned {
         let (res, subs, states) = &items[*k];
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
+    crate::hle::d3d12x::gpu_profile::own_list_end(windows::core::Interface::as_raw(&up.list), crate::hle::d3d12x::gpu_profile::Kind::TextureUpload);
     up.list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
