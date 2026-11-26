@@ -61,6 +61,15 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
 /// cleanly without prematurely breaking synchronization.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// lab: `XCL_GPU_WAIT_MS=n` – the watchdog releases a GPU wait on the CPU after n ms instead of 5000
+/// (a release lets the waiting queue run ahead of what the title made it wait for).
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var("XCL_GPU_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(GPU_WAIT_WATCHDOG_TIMEOUT, Duration::from_millis)
+    });
+    *T
+}
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -1501,7 +1510,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1551,7 +1560,7 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
