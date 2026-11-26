@@ -3065,6 +3065,22 @@ impl Em {
                     _ => return Err("image_atomic"),
                 };
                 let signed = base.ends_with("smin") || base.ends_with("smax");
+                if dmask == 0x3 {
+                    // two dwords: one 64-bit number (VDATA + 1 the high word) on a 32_32 texel –
+                    // SM 6.6's 64-bit atomics on typed resources. A retail title's hair
+                    // rasteriser keeps the nearest strand that way (`image_atomic_umax` of
+                    // depth : strand); as a 32-bit atomic of the low word the depth was lost.
+                    let (lo, hi) = (self.vreg(vdata), self.vreg(vdata + 1));
+                    let vt = if signed { "int64_t" } else { "uint64_t" };
+                    self.line(&format!("{vt} {t}_old = 0;"));
+                    self.line(&format!(
+                        "if (and({act}, {t}_ok)) {{ RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)]; {op}({t}_U[{icoord}], ({vt})((((uint64_t){hi}) << 32) | (uint64_t){lo}), {t}_old); }}"
+                    ));
+                    if f("GLC") == 1 {
+                        self.line(&format!("if ({act}) {{ {lo} = (uint)((uint64_t){t}_old); {hi} = (uint)(((uint64_t){t}_old) >> 32); }}"));
+                    }
+                    return Ok(());
+                }
                 let v = self.vreg(vdata);
                 let vt = if signed { "int" } else { "uint" };
                 let val = if signed { format!("(int){v}") } else { v.clone() };

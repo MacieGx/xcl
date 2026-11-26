@@ -10595,3 +10595,31 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// A 64-bit `image_atomic_umax` (`DMASK` 0x3 on a 32_32_UINT image: the two dwords are one
+/// number, the second the high word), as the retail title's hair rasteriser keeps the nearest
+/// strand per pixel (depth in the high word, the strand in the low one). 64 lanes on one texel:
+/// the texel ends as the largest 64-bit value, not as the largest low word.
+#[test]
+fn gpu_image_atomic_umax_64bit() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let mut code = encode("IMAGE_ATOMIC_UMAX", "ENC_MIMG", &[("VDATA", 6), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 62, 9));
+    // the high words are a permutation of 100..163 over the lanes; lane 63 has the largest low word
+    let value = |l: u32| (((l * 29) % 64 + 100, 1000 + l));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (hi, lo) = value(l as u32);
+        (r[4], r[5], r[6], r[7]) = (0, 0, lo, hi);
+    }
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let word = |i: usize| u32::from_le_bytes(r.textures[0][4 * i..4 * i + 4].try_into().unwrap());
+    let want = (0..64).map(value).max().unwrap();
+    assert_eq!((word(1), word(0)), want, "the texel as (high, low): the largest 64-bit value");
+}
