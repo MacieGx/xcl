@@ -3713,7 +3713,7 @@ fn gpu_mesh_native_draws_what_the_two_passes_draw() {
     let groups = 2;
     let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, groups, ms.record_dwords(), &sg, &mem, 64, [-1.0; 4]).unwrap();
     // the native form: no compute pass (an empty one keeps the runner's shape)
-    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_native: Some(MeshNative { ps_inputs: None, mirror: true }), ..Default::default() };
+    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_native: Some(MeshNative { ps_inputs: None, mirror: true, io_base: 0 }), ..Default::default() };
     let nt = translate(&code, &nopt).unwrap();
     assert!(nt.complete(), "{:?}", nt.unsupported_why);
     let native = dxc::compile(&nt.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", nt.hlsl));
@@ -3738,6 +3738,79 @@ fn gpu_mesh_native_draws_what_the_two_passes_draw() {
     assert!(lit > 200, "the two passes drew {lit} pixels");
     let differ = px.iter().zip(&npx).filter(|(a, b)| a != b).count();
     assert_eq!(differ, 0, "pixels that differ between the two forms ({lit} drawn)");
+    // as a pipeline binds it (`bind::bind_native_mesh`): the pixel shader's SGPR block first
+    // (here words the program must not take), the mesh program's after it
+    let popt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_native: Some(MeshNative { ps_inputs: None, mirror: false, io_base: super::KERNEL_SGPRS as u32 }), ..Default::default() };
+    let pt = translate(&code, &popt).unwrap();
+    let second = dxc::compile(&pt.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let mut both = vec![0xDEAD_BEEFu32; super::KERNEL_SGPRS];
+    both.extend(&sg);
+    let (ppx, _) = runner::mesh_draw(&idle, &second, &ps, groups, ms.record_dwords(), &both, &mem, 64, [-1.0; 4]).unwrap();
+    assert_eq!(px.iter().zip(&ppx).filter(|(a, b)| a != b).count(), 0, "pixels that differ with the SGPRs in the second block");
+}
+
+/// The native mesh shader the runtime makes for a title's program (`pso::native_mesh`, as
+/// `XCL_NATIVE_MESH=1` does) is accepted by the driver in a pipeline and draws: the same pixels
+/// as the two passes on the same made-up memory. `XCL_SAMPLE_RPF`, `XCL_MESH_NAME`.
+#[test]
+fn retail_native_mesh_pipeline_draws_what_the_two_passes_draw() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough};
+    let want = std::env::var("XCL_MESH_NAME").unwrap_or_else(|_| "MS_VS_CascadeShadows_draw_f6ce4799_Wrapped".into());
+    let data = std::fs::read(path).unwrap();
+    let Some(r) = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name == want) else {
+        println!("{want}: not in the pack");
+        return;
+    };
+    let blob = crate::gpu::pack::inflate(&data, &r).unwrap();
+    let tp = super::pso::native_mesh(&blob, None, 1).unwrap().expect("a program the native form takes");
+    assert!(tp.native && tp.cs.is_empty());
+    let ms = tp.record.clone();
+    let sh = crate::gpu::xbox::parse(&blob).unwrap();
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).unwrap();
+    let p = f.programs.first().unwrap();
+    let code = &f.data[p.offset..p.offset + p.len];
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, rodata: f.rodata(p), ..Default::default() });
+    let t = translate(code, &opt).unwrap();
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let msb = dxc::compile(&mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap();
+    // every vertex of the made-up memory lands on one point, so the picture is the target's
+    // clear colour unless a form goes wrong; the position is forced onto the target instead
+    let ps = dxc::compile("float4 main(float4 pos : SV_Position) : SV_Target0 { return float4(1.0, 0.0, 0.0, 1.0); }\n", "main", "ps_6_6", &[]).unwrap();
+    const TABLE: usize = 0x1000;
+    const DATA: usize = 0x2000;
+    let mut mem = vec![0u32; 0x10000 / 4];
+    let mut z = 0x9E37_79B9u32;
+    for w in mem[DATA / 4..].iter_mut() {
+        z ^= z << 13;
+        z ^= z >> 17;
+        z ^= z << 5;
+        *w = z & 0x3FF;
+    }
+    for k in 0..(DATA - TABLE) / 16 {
+        mem[TABLE / 4 + 4 * k..TABLE / 4 + 4 * k + 4].copy_from_slice(&[DATA as u32, 1 << 16, 0xE000, 0x1101_4FAC]);
+    }
+    let groups = 4u32;
+    mem[DATA / 4] = groups;
+    for m in 0..groups as usize {
+        mem[DATA / 4 + 3 + 4 * m] = (39 + 25 * m as u32) | (29 + 29 * m as u32) << 7;
+        mem[DATA / 4 + 4 + 4 * m] = 0;
+    }
+    let mut sg = vec![0u32; 128];
+    for s in sg[8..32].iter_mut() {
+        *s = TABLE as u32;
+    }
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, groups, ms.record_dwords(), &sg, &mem, 64, [-1.0; 4]).unwrap();
+    let idle = dxc::compile("[numthreads(1, 1, 1)]\nvoid main() {}\n", "main", "cs_6_6", &[]).unwrap();
+    let mut both = vec![0xDEAD_BEEFu32; super::KERNEL_SGPRS];
+    both.extend(&sg);
+    let (npx, _) = runner::mesh_draw(&idle, &tp.ms, &ps, groups, ms.record_dwords(), &both, &mem, 64, [-1.0; 4]).unwrap();
+    let lit = px.iter().filter(|p| p[3] == 1.0).count();
+    println!("{want}: native mesh shader {} B; the two passes counted {:?} vertices / primitives in group 0 and drew {lit} pixels", tp.ms.len(), (rec[0], rec[1]));
+    assert_eq!(px.iter().zip(&npx).filter(|(a, b)| a != b).count(), 0, "pixels that differ between the two forms");
 }
 
 /// A title's mesh program in both forms on the same memory: every vertex and primitive dword
@@ -3778,7 +3851,7 @@ fn retail_mesh_native_matches_the_two_pass_records() {
     let pass = mesh_passthrough(&ms);
     let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let ps = dxc::compile("float4 main(float4 pos : SV_Position) : SV_Target0 { return float4(1.0, pos.z, 0.0, 1.0); }\n", "main", "ps_6_6", &[]).unwrap();
-    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64, rodata: f.rodata(p), mesh_native: Some(MeshNative { ps_inputs: None, mirror: true }), ..Default::default() };
+    let nopt = Options { mode: Mode::Mesh(ms.clone()), wave64, rodata: f.rodata(p), mesh_native: Some(MeshNative { ps_inputs: None, mirror: true, io_base: 0 }), ..Default::default() };
     let nt = translate(code, &nopt).unwrap();
     assert!(nt.complete(), "{:?}", nt.unsupported_why);
     if let Ok(dir) = std::env::var("XCL_MESH_HLSL_DIR") {

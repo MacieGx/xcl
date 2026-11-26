@@ -4973,12 +4973,14 @@ impl Em {
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
+        // (a native mesh shader's block is not the first of `io`: `MeshNative::io_base`)
+        let io_base = self.opt.mesh_native.as_ref().map_or(0, |n| n.io_base as usize);
         let load_sgprs = |h: &mut String| {
             if windows > 1 {
-                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", (io_base + super::IO_UMA_BASE_HI) * 4);
             }
             for &c in &sg {
-                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), (io_base + c as usize) * 4);
             }
         };
         match &self.opt.mode {

@@ -183,6 +183,9 @@ pub struct MeshNative {
     /// tests: each thread also stores its vertex and primitive where the two-pass compute
     /// pass puts them in the group's record (`res`), so the two forms can be compared
     pub mirror: bool,
+    /// dword of `io` the program's SGPR block starts at: in a pipeline the pixel shader's block
+    /// is at 0 (one root signature, one `io`), so the runtime puts the mesh program's after it
+    pub io_base: u32,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare

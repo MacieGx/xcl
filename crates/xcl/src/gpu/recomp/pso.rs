@@ -1170,13 +1170,16 @@ pub struct TwoPass {
     pub mesh_groups_per_record: u32,
     /// static samplers of the compute pass
     pub samplers: Vec<StaticSampler>,
+    /// `XCL_NATIVE_MESH=1`: `ms` is the console program itself as a mesh shader
+    /// (`Options::mesh_native`) and there is no compute pass (`cs` is empty)
+    pub native: bool,
 }
 
 fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
     let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
+    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers, native: false })
 }
 
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
@@ -1267,7 +1270,24 @@ fn console_mesh_with(
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
-    console_mesh_in(blob, ps, split_wave64, mem_windows())
+    // (the runtime alone: `xcl shaders --precompile` builds the compute passes, `console_mesh_in`)
+    let windows = mem_windows();
+    if native_mesh_on() {
+        match native_mesh(blob, ps, windows) {
+            Ok(Some(tp)) => return Ok(tp),
+            Ok(None) => {}
+            // (a cached-only attempt: asked again by the worker)
+            Err(e) if e == "DXIL not compiled yet" => return Err(e),
+            Err(e) => {
+                native_mesh_note(3);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!("recompiler: native mesh shader for MS {:016x} failed, two passes instead: {e}", crate::gpu::shader::fnv64(blob));
+                }
+            }
+        }
+    }
+    console_mesh_in(blob, ps, split_wave64, windows)
 }
 
 /// `console_mesh` with the title's memory windows given (`xcl shaders --precompile` builds the
@@ -1278,6 +1298,100 @@ pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windo
     console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
         compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
     })
+}
+
+/// `XCL_NATIVE_MESH=1`: a console mesh program that can (`native_mesh`) is the pipeline's mesh
+/// shader itself; the others, and all without the switch, run in two passes.
+pub fn native_mesh_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_NATIVE_MESH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_NATIVE_MESH_ROWS` (default 3): the most float4 vertex rows, position included, a
+/// native mesh shader may declare for its pixel shader. 3 keeps it to the depth and shadow
+/// programs (position, or position + one or two rows); up to 16 fit D3D12's 32 KiB of outputs.
+fn native_mesh_rows() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| std::env::var("XCL_NATIVE_MESH_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3usize).clamp(1, 16))
+}
+
+/// Mesh programs the driver refused as a native mesh shader (`deny_native_mesh`): two passes.
+static NATIVE_MESH_DENIED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+
+pub fn deny_native_mesh(blob: &[u8]) {
+    NATIVE_MESH_DENIED.lock().unwrap().get_or_insert_with(Default::default).insert(crate::gpu::shader::fnv64(blob));
+}
+
+/// Pipelines by what `native_mesh` said: native, refused by the program's rules, by its rows,
+/// failed; logged at powers of two.
+fn native_mesh_note(k: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    N[k].fetch_add(1, Ordering::Relaxed);
+    let n: Vec<u64> = N.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if n.iter().sum::<u64>().is_power_of_two() {
+        crate::xlog_info!(
+            "recompiler: native mesh: {} pipelines native, two passes for {} by the program's rules, {} by rows (over {}) or samplers, {} failed",
+            n[0], n[1], n[2], native_mesh_rows(), n[3]
+        );
+    }
+}
+
+/// Native mesh shaders made so far: (console MS, pixel input signature, windows) → DXIL, or
+/// None for a program that stays in two passes.
+#[allow(clippy::type_complexity)]
+static NATIVE_MESH: Mutex<Option<HashMap<(u64, u64, u32), Option<Arc<Vec<u8>>>>>> = Mutex::new(None);
+
+/// The console mesh program of `blob` as a native mesh shader for the pixel shader `ps`
+/// (`Options::mesh_native`), when `mesh_native::report` has nothing against it, it has no
+/// static samplers and its vertex rows are within `native_mesh_rows`. Ok(None): two passes.
+/// The mesh shader loads its SGPRs from the second block of `io` (`MeshNative::io_base`).
+pub(crate) fn native_mesh(blob: &[u8], ps: Option<&[u8]>, windows: u32) -> Result<Option<TwoPass>, String> {
+    let hash = crate::gpu::shader::fnv64(blob);
+    if NATIVE_MESH_DENIED.lock().unwrap().as_ref().is_some_and(|d| d.contains(&hash)) {
+        return Ok(None);
+    }
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let Some(Mode::Mesh(ms)) = interface(blob, &sh, f) else { return Ok(None) };
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let key = (hash, crate::gpu::shader::fnv64(format!("{ps_inputs:?}").as_bytes()), windows);
+    let done = |dxil: &Arc<Vec<u8>>| TwoPass { cs: Vec::new(), ms: dxil.as_ref().clone(), record: ms.clone(), mesh_groups_per_record: 1, samplers: Vec::new(), native: true };
+    if let Some(known) = NATIVE_MESH.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+        native_mesh_note(if known.is_some() { 0 } else { 1 });
+        return Ok(known.as_ref().map(done));
+    }
+    let keep = |v: Option<Arc<Vec<u8>>>| {
+        NATIVE_MESH.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, v);
+    };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let rows = 1 + super::emit::passthrough_elements(&ms, ps_inputs.as_deref());
+    if rows > native_mesh_rows() || super::mesh_native::output_bytes(ms.max_vertices, rows as u32) > super::mesh_native::OUTPUT_BYTES {
+        native_mesh_note(2);
+        keep(None);
+        return Ok(None);
+    }
+    if !super::fssm_wave64(f, code) || !super::mesh_native::report(code, &ms).blockers.is_empty() {
+        native_mesh_note(1);
+        keep(None);
+        return Ok(None);
+    }
+    let native = super::MeshNative { ps_inputs, mirror: false, io_base: super::KERNEL_SGPRS as u32 };
+    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, mem_windows: windows, rodata: f.rodata(p), mesh_native: Some(native), ..Default::default() })?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    if !t.static_samplers.is_empty() {
+        native_mesh_note(2);
+        keep(None);
+        return Ok(None);
+    }
+    let dxil = Arc::new(dxc::compile_cached(&t.hlsl, "main", "ms_6_6")?.0);
+    keep(Some(dxil.clone()));
+    native_mesh_note(0);
+    Ok(Some(done(&dxil)))
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -1337,7 +1451,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
                 let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers, native: false });
             }
             Err(e) => direct_fallback("GS", &e),
         }

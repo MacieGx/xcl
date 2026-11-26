@@ -6429,6 +6429,9 @@ pub struct TwoPassPso {
     pub ms_hash: u64,
     /// lab (`shared_passes`): what `SHARED_PASSES` knows `compute` by
     pass_key: (u64, usize, i32),
+    /// `XCL_NATIVE_MESH`: the pipeline's mesh shader is the console program itself
+    /// (`pso::TwoPass::native`): no compute pass, no record – one draw
+    pub native: bool,
 }
 
 impl Drop for TwoPassPso {
@@ -6510,6 +6513,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 kind,
                 ms_hash: 0,
                 pass_key: (0, 0, 0),
+                native: false,
             }),
         );
     }
@@ -6877,6 +6881,22 @@ unsafe fn finish_two_pass(
     let mkey = mesh_blob_key(stream, mesh_samplers);
     let mdisk = driver_cache::mesh_path(mkey.0, mkey.1);
     let mcached = cached_mesh_blob(mkey, mdisk.as_deref());
+    if tp.native {
+        // the console program is the mesh shader: this pipeline is all there is (its blob key
+        // holds the shader's bytes, so the native form has its own driver blobs)
+        let (hr, _) = create_mesh_pso(stream, mkey, mcached, mdisk.as_deref(), COMPUTE_BLOB_MIN_DXIL, kind, ms_hash, ppv, |desc| finish_pso(this, fs, desc, riid, ppv));
+        if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+            return if hr < 0 { hr } else { E_INVALIDARG };
+        }
+        note_pso_rs(*ppv, mesh_rs);
+        TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: 1, kind, ms_hash, pass_key: (0, 0, 0), native: true }));
+        static NATIVE: AtomicU64 = AtomicU64::new(0);
+        let n = NATIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 5 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: pipeline #{n} from the console {kind} {ms_hash:016x} as a native mesh shader ({} B DXIL)", tp.ms.len());
+        }
+        return hr;
+    }
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
@@ -6960,7 +6980,7 @@ unsafe fn finish_two_pass(
         // (another thread's pass of the same program may be there by now: that one stays)
         SHARED_PASSES.lock().unwrap().get_or_insert_with(HashMap::new).entry(ckey).or_insert(compute as usize);
     }
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, ms_hash, pass_key: ckey }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, ms_hash, pass_key: ckey, native: false }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -7232,11 +7252,20 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             let _ = std::fs::write(f, ps);
         }
     }
+    let native = tp.native;
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", ms_hash, riid, ppv);
+    if native && (hr < 0 || ppv.is_null() || (*ppv).is_null()) {
+        // the driver refused the native mesh shader: this program in two passes from now on
+        crate::xlog_warn!("D3D12.X: the driver rejected the native mesh pipeline of MS {ms_hash:016x} ({hr:#x}): two passes instead");
+        crate::gpu::recomp::pso::deny_native_mesh(ms);
+        return translated_mesh_stream_once(this, desc, riid, ppv);
+    }
     if hr >= 0 && !ppv.is_null() {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
         if let Some(tp) = TWO_PASS.lock().unwrap().as_ref().and_then(|m| m.get(&(*ppv as usize)).cloned()) {
-            TWO_PASS_PS.lock().unwrap().get_or_insert_with(HashMap::new).insert(tp.compute, ps_hash);
+            if !tp.native {
+                TWO_PASS_PS.lock().unwrap().get_or_insert_with(HashMap::new).insert(tp.compute, ps_hash);
+            }
         }
     }
     Some(hr)
@@ -9713,6 +9742,7 @@ mod mesh_stream_tests {
             record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1, params: None },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
+            native: false,
         };
         let stream = StreamOut::default();
         let iid = pc_iid(Kind::PipelineState);

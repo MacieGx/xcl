@@ -1365,7 +1365,7 @@ pub fn mesh_draw_split(
         dev.CreateRenderTargetView(&rt, None, rtv);
 
         let mut io = sgprs.to_vec();
-        io.resize(KERNEL_SGPRS, 0);
+        io.resize(io.len().max(KERNEL_SGPRS), 0);
         let io_bytes = (io.len() * 4) as u64;
         let mem_len = mem.len().max(64);
         let mem_bytes = (mem_len * 4) as u64;
