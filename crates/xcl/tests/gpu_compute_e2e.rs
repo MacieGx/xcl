@@ -306,6 +306,59 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A title's preparation worker (`XCL_PRECOMPILE_PARENT`) leaves the whole form of a split
+/// program in the driver cache besides its pieces: the title needs it at a split program's first
+/// ExecuteIndirect, and builds it there itself when it is missing.
+#[test]
+fn a_preparation_worker_also_builds_a_split_programs_whole_form() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("no wave32 GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-worker-whole-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("split.bin"), console_cs(&split_program(), 2 << 1 | 1 << 7, [32, 1, 1])).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .arg(&input)
+        .args(["--precompile", "--pipelines", "--windows", "1"])
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_DIRECT_DXIL", "1")
+        .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+        .env("XCL_PSO_DISK_CACHE", "1")
+        // as `pipelines_in_workers` starts it: this test is its parent
+        .env("XCL_PRECOMPILE_PARENT", std::process::id().to_string())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}
+{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    // the split program's pieces, as the precompile counts them ("split compute programs: 1 (N
+    // pieces)"); the whole form is one more pipeline, its blob kept beside theirs
+    let pieces: usize = text
+        .split("split compute programs: 1 (")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no split program: {text}"));
+    assert!(pieces >= 2, "{text}");
+    assert!(text.contains(&format!("pipelines made on the GPU {}, refused 0", pieces + 1)), "the whole form was not built: {text}");
+    assert_eq!(files.len(), pieces + 1, "a blob for each piece and the whole form: {files:?}
+{text}");
+    assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.

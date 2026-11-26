@@ -2045,7 +2045,10 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                         Ok((c, path)) => {
                             if let Some(p) = pipelines {
                                 p.make_with_cache_path(&c, path);
-                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                // (a title's preparation worker too: the title would otherwise
+                                // build a split program's whole form at its first ExecuteIndirect,
+                                // on its own thread, 15 – 25 s a program cold)
+                                if (startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some()) && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
                                     p.make_one(&c.dxil, &c.samplers, true, None);
                                 }
                             }
