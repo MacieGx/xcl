@@ -141,6 +141,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
         .env("XCL_DATA_ROOT", &data)
         // the shader dumps and their translation, which the report's shader counts come from
         .env("XCL_DUMP_SHADERS", "1")
+        // lab: the preparation before the title runs only when asked for
+        .env("XCL_PREPARE", "1")
         .output()
         .expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);

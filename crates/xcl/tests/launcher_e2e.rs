@@ -31,6 +31,7 @@ fn unreadable_shader_pack_stops_launch_before_host_start() {
         .args(["run"]).arg(&game.0)
         .env("XCL_DATA_ROOT", game.0.join("user"))
         .env("XCL_SKIP_CPU_CHECK", "1")
+        .env("XCL_PREPARE", "1")
         .output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("No readable shader records"));

@@ -45,10 +45,11 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir()) {
         return Ok(());
     }
-    // `XCL_PREPARE=0`: the title starts at once and builds what it uses as it goes (it stands
-    // still for those builds): for a look at a change without the wait
-    if std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") {
-        crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
+    // lab: only with `XCL_PREPARE=1` (unset or 0: the title starts at once and builds what it
+    // uses as it goes, as the lab's runs did before; a first preparation with no
+    // used-shaders.txt takes every record, about an hour)
+    if !prepare_wanted(std::env::var("XCL_PREPARE").ok().as_deref()) {
+        crate::xlog_info!("Shader preparation left out (lab: XCL_PREPARE=1 prepares): the title builds what it uses as it goes");
         return Ok(());
     }
     let only = Some(crate::hle::d3d12x::pso_async::earlier_used_shaders())
@@ -217,6 +218,11 @@ impl StallClock {
     }
 }
 
+/// lab: whether the shader preparation runs before the title (`XCL_PREPARE`): only when set to 1.
+fn prepare_wanted(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim() == "1")
+}
+
 fn percent(done: usize, total: usize, ready: bool) -> usize {
     if ready { 100 } else { done.saturating_mul(100).checked_div(total).unwrap_or(0).min(99) }
 }
@@ -245,6 +251,16 @@ mod tests {
         progress.cancel.store(true, Ordering::Relaxed);
         assert!(!screen.release());
         assert!(!screen.ready);
+    }
+
+    /// lab: the preparation runs only when asked for.
+    #[test]
+    fn the_preparation_runs_only_with_xcl_prepare_1() {
+        assert!(!prepare_wanted(None));
+        assert!(!prepare_wanted(Some("0")));
+        assert!(!prepare_wanted(Some("")));
+        assert!(prepare_wanted(Some("1")));
+        assert!(prepare_wanted(Some(" 1 ")));
     }
 
     #[test]

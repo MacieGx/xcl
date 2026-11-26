@@ -237,7 +237,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.
 - When a game folder contains a `shaders.rpf` shader pack or loose `.dxbc` files under
-  `shaders/`, XCL shows shader preparation in the game window before executing title code.
+  `shaders/` and `XCL_PREPARE=1` is set (lab branch: off otherwise), XCL shows shader
+  preparation in the game window before executing title code.
   The same window then presents the game. The percentage counts
   processed records. The timer counts seconds since one finished (or preparation started);
   five seconds without progress counts as a stall, and the window shows when the last one ended.
