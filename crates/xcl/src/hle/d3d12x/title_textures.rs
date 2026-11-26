@@ -1087,12 +1087,23 @@ pub(super) fn is_own_work() -> bool {
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
 pub(super) unsafe fn refresh(queue: *mut c_void) {
+    refresh_for(queue, &[]);
+}
+
+/// `refresh` before the title's ExecuteCommandLists of `lists` (its own pointers; none: a submit
+/// that always looks). `XCL_LOOK_JOIN=1`: a submit all of whose lists were closed before the last
+/// look began goes without a look of its own (`look_join`).
+pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     // the uploads' own ExecuteCommandLists come back here
     if BUSY.with(|b| b.get()) {
         return;
     }
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    // with the lock: the look before this one is done, and its uploads are submitted
+    let covered = super::look_join::covered(lists);
+    let look = !(covered && super::look_join::joins());
+    let took = own_work(|| refresh_once(queue, look));
+    super::look_join::submit_done(covered, took);
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -1288,6 +1299,7 @@ unsafe fn walk() {
                     for b in found.drain(..) {
                         if let std::collections::btree_map::Entry::Vacant(v) = h.hot.entry(b) {
                             v.insert(now);
+                            super::look_join::note_walk_found();
                             HOT_STATS[3].fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -1300,15 +1312,21 @@ unsafe fn walk() {
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void) {
-    let Some(u) = crate::gpu::uma::get() else { return };
+/// `look`: whether the write watch is asked (not for a submit the last look covers,
+/// `look_join`: it uploads what is pending and has its queue wait, no more). Returns the look's
+/// time and the written pages it found.
+unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Duration, usize)> {
+    let u = crate::gpu::uma::get()?;
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
-        return;
+        return None;
     }
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
+    if look {
+        super::look_join::look_begins();
+    }
     let ranges = cached_watch_ranges(u);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
@@ -1318,7 +1336,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            if hot_looks() {
+            if !look {
+            } else if hot_looks() {
                 take_hot(&ranges, &mut buf, &mut dirty, &mut page);
             } else {
                 for &(base, size) in ranges.iter() {
@@ -1329,7 +1348,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    let took = look.then(|| (watch_t0.elapsed(), dirty_len));
+    if look {
+        super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -1372,7 +1394,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
-        return;
+        return took;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
@@ -1419,6 +1441,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     super::vram::touch(todo.iter().map(|(r, _)| r.as_raw() as usize));
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo);
+    took
 }
 
 /// texture → `content_hash` of its memory at its last upload

@@ -3288,6 +3288,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
+    super::look_join::note_list_closed(this as usize);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -8521,7 +8522,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
     removed_probe("execute: after refresh");
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {

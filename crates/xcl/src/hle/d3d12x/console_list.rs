@@ -443,6 +443,7 @@ macro_rules! list_forward {
 list_forward!(cl_3 = 3, cl_4 = 4, cl_5 = 5, cl_6 = 6, cl_7 = 7, cl_8 = 8);
 
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    super::look_join::note_list_closed(this as usize);
     match close(this) {
         Ok(_) => S_OK,
         Err(e) => {
