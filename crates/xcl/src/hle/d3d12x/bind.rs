@@ -2004,6 +2004,22 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
     Some((groups, limits))
 }
 
+/// lab: `XCL_DISPATCHX_THREADS=1` launches a `DispatchX` with thread dimensions as whole groups
+/// (`dispatch_groups`); unset, its counts are launched as groups, as the lab's runs did before.
+fn thread_dimensions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_DISPATCHX_THREADS").is_ok_and(|v| v.trim() == "1");
+        crate::xlog_info!("D3D12.X: DispatchX thread dimensions (0x20) {}", if on { "launched as whole groups (XCL_DISPATCHX_THREADS=1)" } else { "launched as group counts (lab: XCL_DISPATCHX_THREADS=1 converts them)" });
+        on
+    })
+}
+
+/// lab: the flags `dispatch_groups` takes: without `on` (`thread_dimensions`), no thread dimensions.
+fn lab_dispatch_flags(flags: u32, on: bool) -> u32 {
+    if on { flags } else { flags & !DISPATCH_THREAD_DIMENSIONS }
+}
+
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     super::targets::note_dispatch();
@@ -2023,7 +2039,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         count(DISPATCHES_SKIPPED);
         return;
     }
-    let Some((groups, limits)) = dispatch_groups(pso, [x, y, z], flags) else {
+    let Some((groups, limits)) = dispatch_groups(pso, [x, y, z], lab_dispatch_flags(flags, thread_dimensions())) else {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
@@ -3374,6 +3390,18 @@ void main(uint t : SV_GroupIndex) {
         // thread dimensions on a pipeline whose group shape is not known: not launched
         assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0x20), None);
         assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0), Some(([100, 1, 1], [0, 0, 0])));
+    }
+
+    /// lab: without `XCL_DISPATCHX_THREADS=1` a DispatchX's counts are launched as groups, as
+    /// before; with it, thread dimensions reach `dispatch_groups`.
+    #[test]
+    fn dispatch_x_thread_dimensions_follow_the_lab_switch() {
+        let pso = 0x7300_0003usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        assert_eq!(lab_dispatch_flags(0x8020, false), 0x8000);
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], lab_dispatch_flags(0x20, false)), Some(([100, 1, 1], [0, 0, 0])));
+        assert_eq!(lab_dispatch_flags(0x8020, true), 0x8020);
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], lab_dispatch_flags(0x20, true)), Some(([2, 1, 1], [100, 0, 0])));
     }
 
     #[test]
