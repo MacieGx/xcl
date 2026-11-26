@@ -1071,8 +1071,14 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
     g.iter().rev().find(|info| info.ty == ty && (device == 0 || info.device == 0 || info.device == device)).map(|info| info.queue)
 }
 
+/// The title records a write into memory on `list` (a copy, a fill, a value): the runs of
+/// two-pass ExecuteIndirects whose records it may write end there (`indirect_clamp`).
+fn title_writes(list: *mut c_void) {
+    super::clamp_runs::write(list as usize);
+    super::indirect_clamp::run_stop(list as usize);
+}
+
 fn note_write(list: usize, va: u64, size: u64) {
-    super::clamp_runs::write(list);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
@@ -2337,6 +2343,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    title_writes(this);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
@@ -2674,16 +2681,19 @@ fn pattern(bytes: &[u8]) -> [u8; 16] {
 
 /// command list #61 FillMemoryWith32BitValueX(address, size, value)
 pub(super) unsafe extern "system" fn fill32_x(this: *mut c_void, va: u64, size: u64, value: u32) {
+    title_writes(this);
     fill(this, va, size, pattern(&value.to_le_bytes()), 4, "FillMemoryWith32BitValueX");
 }
 
 /// command list #62 FillMemoryWith64BitValueX(address, size, value)
 pub(super) unsafe extern "system" fn fill64_x(this: *mut c_void, va: u64, size: u64, value: u64) {
+    title_writes(this);
     fill(this, va, size, pattern(&value.to_le_bytes()), 8, "FillMemoryWith64BitValueX");
 }
 
 /// command list #63 FillMemoryWith128BitValueX(address, size, value*)
 pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size: u64, value: *const [u8; 16]) {
+    title_writes(this);
     if !value.is_null() {
         fill(this, va, size, value.read_unaligned(), 16, "FillMemoryWith128BitValueX");
     }
@@ -2823,12 +2833,14 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, flags: u32) {
+    title_writes(this);
     record_write_trace(this, va, value as u64, flags, "W32B");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
 }
 
 /// command list #70 Write64BitValueBottomOfPipeX(address, value, flush, flags)
 pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
+    title_writes(this);
     const W: &str = "Write64BitValueBottomOfPipeX";
     record_write_trace(this, va, value, flags, "W64B");
     if flags & BOTTOM_TIMESTAMPS != 0 {
@@ -2963,6 +2975,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
         let ext = *(seg as *const usize);
+        super::indirect_clamp::list_closing(seg);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
         last = Some(seg);
@@ -3038,6 +3051,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
 
     let ext = *(list as *const usize);
+    super::indirect_clamp::list_closing(list);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
     if close_hr < 0 {
@@ -3292,12 +3306,14 @@ pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, compar
 
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
 pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, value: u32, flags: u32) {
+    title_writes(this);
     record_write_trace(this, va, value as u64, flags, "W32T");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write32BitValueTopOfPipeX");
 }
 
 /// command list #89 Write64BitValueTopOfPipeX(address, value, flags)
 pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, value: u64, flags: u32) {
+    title_writes(this);
     const W: &str = "Write64BitValueTopOfPipeX";
     record_write_trace(this, va, value, flags, "W64T");
     if flags & TOP_TIMESTAMPS != 0 {
@@ -3309,6 +3325,7 @@ pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, v
 
 /// command list #90 Write32BitValueBottomOfShaderX(address, value, stage)
 pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_void, va: u64, value: u32, stage: u32) {
+    title_writes(this);
     record_write_trace(this, va, value as u64, stage, "W32S");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfShaderX");
 }
@@ -3359,6 +3376,7 @@ pub(super) unsafe extern "system" fn unknown_101_x(this: *mut c_void, a1: usize,
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
+    title_writes(this);
     if dst != src {
         copy_resource_x(this, dst, src);
     }
@@ -3410,6 +3428,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
 /// `D3D12_RESOURCE_STATE_PREDICATION`.
 pub(super) unsafe fn before_close(list: *mut c_void) {
+    super::indirect_clamp::list_closing(list);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3605,6 +3624,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let ext = *(this as *const usize);
+    super::indirect_clamp::list_closing(this);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
@@ -4446,6 +4466,10 @@ const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100
 /// transition left with nothing to do goes, aliasing barriers name placed textures
 pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
     super::clamp_runs::barrier(this as usize);
+    // (a barrier that is no transition: the console's mark that writes before it are read after it)
+    if !barriers.is_null() && (0..n as usize).any(|k| barriers.add(k).read_unaligned()[0] != 0) {
+        super::indirect_clamp::run_stop(this as usize);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if barriers.is_null() || n == 0 {
         return;
@@ -4777,6 +4801,7 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    title_writes(this);
     real::use_buffer(dst);
     real::use_buffer(src);
     if super::present::trace_frame() {
@@ -5018,6 +5043,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    title_writes(this);
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {

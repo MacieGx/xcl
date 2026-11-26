@@ -16,6 +16,14 @@ RWByteAddressBuffer source : register(u0);  // the UMA window holding the title'
 RWByteAddressBuffer bounded : register(u1); // our copy, which ExecuteIndirect reads
 RWByteAddressBuffer counts : register(u2);  // the UMA window holding the count (if any)
 
+#ifdef BATCH
+// One group a call (`indirect_clamp.rs`, `XCL_CLAMP_BATCH`): the calls of a run are jobs in a
+// table the CPU fills while the list is recorded, 8 words each - the 7 below, then where the
+// call's copy starts in `bounded`. A job without records is none. The count the call may run
+// (the title's, at most `records`) is written after the copy's last record.
+ByteAddressBuffer jobs : register(t0);
+static uint records, source_at, stride, action_at, kind, count_at, budget, out_at;
+#else
 cbuffer Config : register(b0) {
     uint records;   // the call's maximum command count
     uint source_at; // byte offset of record 0 in `source`
@@ -25,6 +33,8 @@ cbuffer Config : register(b0) {
     uint count_at;  // byte offset of the count in `counts`; 0xFFFFFFFF: no count buffer
     uint budget;    // work the whole call may ask for (threads; see clamp_args)
 };
+static const uint out_at = 0;
+#endif
 
 groupshared uint scan[THREADS];
 groupshared uint carry;
@@ -57,12 +67,24 @@ uint clamp_args(inout uint3 a) {
 }
 
 [numthreads(THREADS, 1, 1)]
-void main(uint t : SV_GroupIndex) {
+void main(uint t : SV_GroupIndex, uint3 group : SV_GroupID) {
+#ifdef BATCH
+    uint4 j0 = jobs.Load4(group.x * 32);
+    uint4 j1 = jobs.Load4(group.x * 32 + 16);
+    records = j0.x; source_at = j0.y; stride = j0.z; action_at = j0.w;
+    kind = j1.x; count_at = j1.y; budget = j1.z; out_at = j1.w;
+    if (records == 0)
+        return;
+#endif
     if (t == 0)
         carry = 0;
     uint live = records;
     if (count_at != 0xFFFFFFFFu)
         live = min(live, counts.Load(count_at));
+#ifdef BATCH
+    if (t == 0)
+        bounded.Store(out_at + records * stride, live);
+#endif
     GroupMemoryBarrierWithGroupSync();
     for (uint first = 0; first < records; first += THREADS) {
         uint i = first + t;
@@ -70,7 +92,7 @@ void main(uint t : SV_GroupIndex) {
         uint work = 0;
         if (i < records) {
             uint src = source_at + i * stride;
-            uint dst = i * stride;
+            uint dst = out_at + i * stride;
             for (uint k = 0; k < stride; k += 4)
                 bounded.Store(dst + k, source.Load(src + k));
             a = source.Load3(src + action_at);
@@ -93,7 +115,7 @@ void main(uint t : SV_GroupIndex) {
                 else
                     a = uint3(0, 0, 0);
             }
-            bounded.Store3(i * stride + action_at, a);
+            bounded.Store3(out_at + i * stride + action_at, a);
         }
         GroupMemoryBarrierWithGroupSync();
         if (t == THREADS - 1)
