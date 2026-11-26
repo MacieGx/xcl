@@ -612,6 +612,7 @@ impl Uma {
             g.free.insert(at + size, start + len - at - size);
         }
         g.used.insert(at, size);
+        SITES.lock().unwrap().insert(self.base + at, (std::panic::Location::caller(), size));
         let again = g.hand_out(at, size);
         let used = if Self::tracing() && size >= 1 << 20 { Some(g.used.values().sum()) } else { None };
         drop(g);
@@ -644,6 +645,7 @@ impl Uma {
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
         let Some(orig) = g.used.remove(&off) else { return false };
+        SITES.lock().unwrap().remove(&p);
         let (mut start, mut len) = (off, orig);
         // merge with the free neighbours
         if let Some((&o, &l)) = g.free.range(..off).next_back() {
@@ -735,6 +737,23 @@ impl Arena {
 }
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
+
+/// lab: the XCL code that asked for each live allocation of the committed window (address ->
+/// caller, bytes): what fills the window.
+static SITES: Mutex<BTreeMap<usize, (&'static std::panic::Location<'static>, usize)>> = Mutex::new(BTreeMap::new());
+
+/// lab: live committed-window allocations by the code that asked: "file:line n x, MB", largest first.
+pub fn used_by_site() -> String {
+    let mut by: std::collections::HashMap<(&str, u32), (usize, usize)> = std::collections::HashMap::new();
+    for (at, n) in SITES.lock().unwrap().values() {
+        let e = by.entry((at.file(), at.line())).or_default();
+        e.0 += 1;
+        e.1 += n;
+    }
+    let mut v: Vec<_> = by.into_iter().collect();
+    v.sort_by_key(|&(_, (_, bytes))| std::cmp::Reverse(bytes));
+    v.iter().take(8).map(|((f, l), (n, bytes))| format!("{}:{l} {n} x, {} MB", f.rsplit(['\\', '/']).next().unwrap_or(*f), bytes >> 20)).collect::<Vec<_>>().join("; ")
+}
 
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is

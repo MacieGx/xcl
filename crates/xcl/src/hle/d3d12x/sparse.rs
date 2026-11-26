@@ -1669,10 +1669,11 @@ pub fn arena_block(bytes: usize) -> Option<usize> {
     if n.is_power_of_two() {
         let (allocators, pending) = super::console_list::pending_blocks();
         crate::xlog_info!(
-            "lab: arena block #{n} ({} KB) from the sparse windows: the coherent window is full ({pending} blocks held for {allocators} allocators, {} in lists that record or wait for their reset){}",
+            "lab: arena block #{n} ({} KB) from the sparse windows: the coherent window is full ({pending} blocks held for {allocators} allocators, {} in lists that record or wait for their reset){}; the window by caller: {}",
             bytes >> 10,
             super::bind::blocks_in_lists() + super::console_list::blocks_in_lists(),
-            if p.is_none() { " - none there either" } else { "" }
+            if p.is_none() { " - none there either" } else { "" },
+            crate::gpu::uma::used_by_site()
         );
     }
     p

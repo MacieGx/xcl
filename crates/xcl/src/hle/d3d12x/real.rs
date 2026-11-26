@@ -7198,8 +7198,14 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     removed_probe("execute: start");
-    // page budget: evicted textures these lists transition are mapped again, uploaded below
-    super::title_textures::revive_listed(&mapped);
+    // page budget: evicted textures these lists transition are mapped again, uploaded below.
+    // Not for XCL's own lists: the zeroing of target pages submits under the pages lock, and a
+    // texture a draw named meanwhile sent this thread into `vram::revive` for that same lock
+    // (lab run G1: the title stood still from 72 s, its watchdog ended it at 101 s; the stalls of
+    // F1 / F2 / T2 look the same, not checked). They are mapped again at the title's next submit.
+    if !super::title_textures::is_own_work() {
+        super::title_textures::revive_listed(&mapped);
+    }
     removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
