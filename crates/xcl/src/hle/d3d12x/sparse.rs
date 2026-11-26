@@ -388,6 +388,60 @@ fn chunk_hash(c: &[u8]) -> u64 {
     hash_words(read_chunk_words(c))
 }
 
+/// lab: `XCL_READBACK_GUARD=1`: a synchronous copy back (`readback_released`) lands a 64-byte
+/// chunk only if the CPU's view of it is as it was when the copy was submitted: the copy is
+/// waited for with `STATE` released, and the title may write there meanwhile (that write is
+/// kept, and goes to video memory with the next submit, as its `sent` hash stays).
+fn readback_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_READBACK_GUARD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// lab (`readback_guard`): chunks a copy back did not land, as the CPU wrote them meanwhile
+static GUARD_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// The hashes of the 64-byte chunks that `parts` (address, offset, bytes) touch in the CPU view,
+/// in order; 0 for a chunk of a page that is not `committed`.
+unsafe fn chunk_hashes(parts: &[(usize, usize, usize)], committed: impl Fn(usize) -> bool) -> Vec<u64> {
+    let mut out = Vec::new();
+    for &(dst, _, len) in parts {
+        let mut c = dst & !(CHUNK - 1);
+        while c < dst + len {
+            out.push(if committed(c & !(PAGE - 1)) { chunk_hash(std::slice::from_raw_parts(c as *const u8, CHUNK)) } else { 0 });
+            c += CHUNK;
+        }
+    }
+    out
+}
+
+/// `parts` (address, offset at `p`, bytes) copied from `p` into the CPU view, a 64-byte chunk at
+/// a time, where the chunk's page is `committed` and the chunk still hashes as `before`
+/// (`chunk_hashes` when the copy was submitted). Returns the chunks landed (address, hash after)
+/// and the number kept as the CPU wrote them.
+unsafe fn land_unchanged(p: *const u8, parts: &[(usize, usize, usize)], before: &[u64], committed: impl Fn(usize) -> bool) -> (Vec<(usize, u64)>, usize) {
+    let (mut landed, mut kept, mut i) = (Vec::new(), 0, 0);
+    for &(dst, off, len) in parts {
+        let end = dst + len;
+        let mut c = dst & !(CHUNK - 1);
+        while c < end {
+            let was = before.get(i).copied();
+            i += 1;
+            if committed(c & !(PAGE - 1)) {
+                let view = std::slice::from_raw_parts(c as *const u8, CHUNK);
+                if was == Some(chunk_hash(view)) {
+                    let (lo, hi) = (c.max(dst), (c + CHUNK).min(end));
+                    std::ptr::copy_nonoverlapping(p.add(off + (lo - dst)), lo as *mut u8, hi - lo);
+                    landed.push((c, chunk_hash(std::slice::from_raw_parts(c as *const u8, CHUNK))));
+                } else {
+                    kept += 1;
+                }
+            }
+            c += CHUNK;
+        }
+    }
+    (landed, kept)
+}
+
 #[inline(always)]
 fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
     match out.last_mut() {
@@ -577,13 +631,18 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
                 continue;
             }
             let value = s.value;
+            // lab (`readback_guard`): the CPU's view as the copy was submitted
+            let before = readback_guard().then(|| chunk_hashes(&parts, |pg| s.page_committed(pg)));
             let (again, there) = wait_released(g, value);
             g = again;
             if !there {
                 return;
             }
             if let Some(s) = g.as_mut() {
-                s.copy_back(p, &parts);
+                match &before {
+                    Some(before) => s.copy_back_unchanged(p, &parts, before),
+                    None => s.copy_back(p, &parts),
+                }
             }
         }
     }
@@ -1330,6 +1389,31 @@ impl State {
                 }
             }
             pg = tile_end;
+        }
+    }
+
+    /// Whether page `pg` is mapped here and committed (not a hole of its tile).
+    fn page_committed(&self, pg: usize) -> bool {
+        let t = pg & !(TILE - 1);
+        self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0)
+    }
+
+    /// lab (`readback_guard`): `copy_back` of the chunks the CPU did not write since `before`
+    /// (`chunk_hashes` at the submit); `sent` hashes follow the chunks landed only.
+    unsafe fn copy_back_unchanged(&mut self, p: *const u8, parts: &[(usize, usize, usize)], before: &[u64]) {
+        let (landed, kept) = land_unchanged(p, parts, before, |pg| self.page_committed(pg));
+        for (c, h) in landed {
+            let pg = c & !(PAGE - 1);
+            let t = pg & !(TILE - 1);
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.sent[(pg - t) / PAGE].get_or_insert_with(|| Box::new(ZERO_HASHES))[(c - pg) / CHUNK] = h;
+            }
+        }
+        if kept > 0 {
+            let n = GUARD_KEPT.fetch_add(kept as u64, Ordering::Relaxed) + kept as u64;
+            if n == kept as u64 || (n - kept as u64).leading_zeros() != n.leading_zeros() {
+                crate::xlog_info!("sparse: a copy back kept {kept} chunks the CPU wrote while it ran ({n} so far; XCL_READBACK_GUARD=1)");
+            }
         }
     }
 
@@ -2585,6 +2669,46 @@ fn forget_in(s: &mut State, res: usize) {
                 s.pinned.remove(&tile);
                 s.release_if_unused(t, tile);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod readback_guard_tests {
+    use super::*;
+
+    /// lab (`XCL_READBACK_GUARD=1`): a copy back lands the chunks the CPU did not write while it
+    /// ran, and keeps the one it wrote; a part that starts and ends inside a chunk copies only its
+    /// own bytes.
+    #[test]
+    fn a_copy_back_keeps_a_chunk_the_cpu_wrote_meanwhile() {
+        unsafe {
+            // a page-aligned "CPU view" of 4 chunks, and what video memory holds
+            let mut page = vec![0u8; 2 * PAGE];
+            let base = (page.as_mut_ptr() as usize + PAGE - 1) & !(PAGE - 1);
+            let view = std::slice::from_raw_parts_mut(base as *mut u8, 4 * CHUNK);
+            view.fill(1);
+            let gpu = vec![9u8; 4 * CHUNK];
+            // bytes 10 .. 4 chunks - 10: the first and last chunks only in part
+            let parts = [(base + 10, 10usize, 4 * CHUNK - 20)];
+            let all = |_: usize| true;
+            let before = chunk_hashes(&parts, all);
+            assert_eq!(before.len(), 4);
+            // the CPU writes chunk 2 while the copy runs
+            view[2 * CHUNK + 5] = 7;
+            let (landed, kept) = land_unchanged(gpu.as_ptr(), &parts, &before, all);
+            assert_eq!(kept, 1);
+            assert_eq!(landed.iter().map(|l| (l.0 - base) / CHUNK).collect::<Vec<_>>(), vec![0, 1, 3]);
+            assert_eq!(&view[..10], &[1u8; 10], "before the part: as it was");
+            assert!(view[10..2 * CHUNK].iter().all(|&b| b == 9));
+            assert_eq!(view[2 * CHUNK + 5], 7, "the CPU's write is kept");
+            assert_eq!(view[2 * CHUNK], 1);
+            assert!(view[3 * CHUNK..4 * CHUNK - 10].iter().all(|&b| b == 9));
+            assert_eq!(&view[4 * CHUNK - 10..], &[1u8; 10], "after the part: as it was");
+            assert_eq!(landed[0].1, chunk_hash(&view[..CHUNK]), "the hash after the landing");
+            // a page that is not committed is neither read nor written
+            let (landed, kept) = land_unchanged(gpu.as_ptr(), &parts, &chunk_hashes(&parts, |_| false), |_| false);
+            assert!(landed.is_empty() && kept == 0);
         }
     }
 }
