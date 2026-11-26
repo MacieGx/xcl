@@ -203,6 +203,9 @@ mod translated {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Backend {
         Hlsl,
+        /// the HLSL path, huge compute programs (direct DXIL of at least this many bytes,
+        /// `huge_direct_min`) through the direct translator
+        HlslHugeDirect(usize),
         /// direct DXIL for compute + the mesh pass (`=1`)
         DirectCompute,
         /// direct DXIL for VS / PS too (`=all`)
@@ -214,7 +217,7 @@ mod translated {
             match (crate::gpu::dxil::kernel::enabled(), crate::gpu::dxil::kernel::enabled_graphics()) {
                 (_, true) => Backend::DirectAll,
                 (true, false) => Backend::DirectCompute,
-                _ => Backend::Hlsl,
+                _ => super::huge_direct_min().map_or(Backend::Hlsl, Backend::HlslHugeDirect),
             }
         }
     }
@@ -230,9 +233,14 @@ mod translated {
         let base = identity_for(source, toolchain);
         let tag = match backend {
             Backend::Hlsl => return base,
+            Backend::HlslHugeDirect(min) => return identity_tagged(base, &format!("huge-direct-{min}"), direct_version),
             Backend::DirectCompute => "compute",
             Backend::DirectAll => "all",
         };
+        identity_tagged(base, tag, direct_version)
+    }
+
+    fn identity_tagged(base: u64, tag: &str, direct_version: u64) -> u64 {
         let mut h = base;
         for part in ["xcl-direct-dxil", tag, &direct_version.to_string()] {
             for byte in part.bytes().chain([0]) {
@@ -243,18 +251,30 @@ mod translated {
         h | 1
     }
 
+    /// The backend whose identity tags `stage`'s entries: the huge-program route only ever
+    /// changes compute entries, so vertex / pixel entries keep the plain HLSL identity and
+    /// are not re-keyed by a bump of the direct translator's version.
+    pub(super) fn backend_for(backend: Backend, stage: Stage) -> Backend {
+        match backend {
+            Backend::HlslHugeDirect(_) if stage != Stage::Compute => Backend::Hlsl,
+            b => b,
+        }
+    }
+
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
-        static I: OnceLock<u64> = OnceLock::new();
-        *I.get_or_init(|| {
+    fn identity(stage: Stage) -> u64 {
+        static COMPUTE: OnceLock<u64> = OnceLock::new();
+        static OTHER: OnceLock<u64> = OnceLock::new();
+        let cell = if stage == Stage::Compute { &COMPUTE } else { &OTHER };
+        *cell.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
             let id =             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
-                Backend::current(),
+                backend_for(Backend::current(), stage),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
@@ -488,7 +508,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, identity(stage), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -591,15 +611,28 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
-        if dxc::defer() {
-            return Err("DXIL not compiled yet".into());
-        }
+        defer_direct_compute()?;
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
                 return Ok((c, false));
             }
             Err(e) => direct_fallback("CS", &e),
+        }
+    }
+    // a huge compute program through the direct translator also without `XCL_DIRECT_DXIL`:
+    // the driver compiles its container 3 - 6x faster than DXC's (`huge_direct_min`)
+    if stage == Stage::Compute && !crate::gpu::dxil::kernel::enabled() {
+        if let Some(min) = huge_direct_min() {
+            defer_direct_compute()?;
+            match direct_compute(blob, sampler_base, windows, split_wave64) {
+                Ok(c) if c.dxil.len() >= min => {
+                    crate::xlog_info!("[SHADER] huge compute program {:016x}: direct DXIL ({} B)", crate::gpu::shader::fnv64(blob), c.dxil.len());
+                    return Ok((c, false));
+                }
+                Ok(_) => {}
+                Err(e) => crate::xlog_info!("[SHADER] huge-program direct DXIL unavailable: {}", e.lines().next().unwrap_or("")),
+            }
         }
     }
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
@@ -945,6 +978,39 @@ pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool)
     console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
 }
 
+/// Direct DXIL size from which a compute program takes the direct translator by default
+/// (no `XCL_DIRECT_DXIL`). Its containers are smaller than DXC's for the same program and
+/// lack the HLSL path's per-access window `switch`es and helper inlining, so the driver
+/// compiles them much faster (RTX 4090, cold: 11.7 s -> 1.8 s, 17.0 s -> 5.9 s,
+/// 19.3 s -> 5.7 s for 107 - 264 KB containers). `XCL_DIRECT_HUGE=0` keeps every program on
+/// the HLSL path, `XCL_DIRECT_HUGE=<KiB>` moves the threshold.
+pub const HUGE_DIRECT_MIN_DEFAULT: usize = 64 << 10;
+
+/// Inside a cached-only probe (`dxc::cached_only`, the non-blocking PSO path): a compute
+/// program bound for the direct translator is not translated there – the translation caches
+/// were already checked – but reported as not compiled yet (`dxc::defer` marks the miss), so
+/// the probe hands out the stand-in and the build happens in the background. Without this a
+/// cold direct translation of a huge program would run synchronously on the title's thread.
+fn defer_direct_compute() -> Result<(), String> {
+    if dxc::defer() {
+        return Err("DXIL not compiled yet".into());
+    }
+    Ok(())
+}
+
+pub fn huge_direct_min() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| huge_direct_min_from(std::env::var("XCL_DIRECT_HUGE").ok().as_deref()))
+}
+
+fn huge_direct_min_from(v: Option<&str>) -> Option<usize> {
+    match v.map(str::trim) {
+        None | Some("") | Some("1") => Some(HUGE_DIRECT_MIN_DEFAULT),
+        Some("0") => None,
+        Some(kib) => Some(kib.parse::<usize>().map_or(HUGE_DIRECT_MIN_DEFAULT, |k| k.max(1) << 10)),
+    }
+}
+
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
 /// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
 /// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
@@ -970,7 +1036,7 @@ fn takes_code_address(code: &[u8]) -> bool {
 
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
-fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
@@ -1534,6 +1600,9 @@ mod shader_cache_tests {
             hlsl,
             identity_with("s", "t", Backend::DirectCompute, 1),
             identity_with("s", "t", Backend::DirectAll, 1),
+            identity_with("s", "t", Backend::HlslHugeDirect(64 << 10), 1),
+            identity_with("s", "t", Backend::HlslHugeDirect(64 << 10), 2),
+            identity_with("s", "t", Backend::HlslHugeDirect(128 << 10), 1),
             identity_with("s", "t", Backend::DirectCompute, 2),
             identity_with("s2", "t", Backend::DirectCompute, 1),
             identity_with("s", "t2", Backend::DirectCompute, 1),
@@ -1556,6 +1625,28 @@ mod shader_cache_tests {
             assert_ne!(id(backend, 7, built), id(backend, 8, built), "{backend:?}: a version bump");
         }
         assert_eq!(id(Backend::Hlsl, 7, built), id(Backend::Hlsl, 8, "edited"));
+    }
+
+    #[test]
+    fn huge_direct_threshold_from_env() {
+        assert_eq!(huge_direct_min_from(None), Some(HUGE_DIRECT_MIN_DEFAULT));
+        assert_eq!(huge_direct_min_from(Some("1")), Some(HUGE_DIRECT_MIN_DEFAULT));
+        assert_eq!(huge_direct_min_from(Some("0")), None);
+        assert_eq!(huge_direct_min_from(Some(" 200 ")), Some(200 << 10));
+        assert_eq!(huge_direct_min_from(Some("junk")), Some(HUGE_DIRECT_MIN_DEFAULT));
+    }
+
+    #[test]
+    fn huge_route_tags_compute_entries_only() {
+        use translated::{backend_for, identity_with, Backend};
+        let huge = Backend::HlslHugeDirect(64 << 10);
+        assert_eq!(backend_for(huge, Stage::Compute), huge);
+        for stage in [Stage::Vertex, Stage::Pixel] {
+            assert_eq!(backend_for(huge, stage), Backend::Hlsl);
+            // a direct translator version bump leaves these entries' identity alone
+            assert_eq!(identity_with("s", "t", backend_for(huge, stage), 1), identity_with("s", "t", backend_for(huge, stage), 2));
+        }
+        assert_eq!(backend_for(Backend::DirectAll, Stage::Pixel), Backend::DirectAll);
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
@@ -2259,6 +2350,38 @@ mod shader_cache_tests {
         assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod direct_probe_tests {
+    use super::*;
+
+    /// The probe contract for both direct compute routes (`XCL_DIRECT_DXIL=1` and the default
+    /// huge-program route): inside `cached_only` nothing is translated – the blob below is not
+    /// even a console container, so any translation attempt would fail differently – and the
+    /// attempt counts as a miss; outside it the same call does translate (and fails to parse).
+    #[test]
+    fn direct_compute_routes_defer_inside_cached_only_probes() {
+        if !crate::gpu::dxil::kernel::enabled() && huge_direct_min().is_none() {
+            return crate::gpu::recomp::runner::skip_test("no direct compute route (XCL_DIRECT_HUGE=0)");
+        }
+        let blob = b"not a console shader";
+        let (r, missed) = dxc::cached_only(|| compile_console_shader(blob, Stage::Compute, 0, 1, false));
+        assert!(missed, "a cached-only probe must mark the direct route as not compiled yet");
+        assert_eq!(r.err().as_deref(), Some("DXIL not compiled yet"));
+        // outside a probe the direct route runs (this blob then fails in translation, not deferral)
+        let e = compile_console_shader(blob, Stage::Compute, 0, 1, false).err().unwrap_or_default();
+        assert_ne!(e, "DXIL not compiled yet");
+        assert!(!dxc::in_cached_only());
+    }
+
+    /// `defer_direct_compute` only defers inside a probe.
+    #[test]
+    fn defer_direct_compute_is_a_no_op_outside_probes() {
+        assert!(defer_direct_compute().is_ok());
+        let (r, missed) = dxc::cached_only(defer_direct_compute);
+        assert!(missed && r.is_err());
     }
 }
 
