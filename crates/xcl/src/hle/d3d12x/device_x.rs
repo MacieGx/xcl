@@ -921,6 +921,31 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        // lab (`XCL_VOLUME_BYTES=0`: off): a 3-D texture whose console size is not known is taken at
+        // its texels' bytes. Without a size it owned as many 64 KiB pages as the PC texture has
+        // tiles - 18 for a 33x33x33 RGBA16F colour LUT the console keeps in 8: a retail title's
+        // LUT targets, 512 KiB apart, shared 10 tiles each with the next one and held each other's
+        // rows by the time the tone map sampled them (black came out cyan).
+        let console_bytes = console_bytes.or_else(|| {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if pc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || *OFF.get_or_init(|| std::env::var("XCL_VOLUME_BYTES").is_ok_and(|v| v.trim() == "0")) {
+                return None;
+            }
+            let texel: u64 = match pc.Format.0 {
+                1..=4 => 16,
+                9..=14 => 8,
+                48..=59 => 2,
+                60..=65 => 1,
+                _ => 4,
+            };
+            let mip0 = pc.Width * pc.Height as u64 * pc.DepthOrArraySize as u64 * texel;
+            let bytes = if pc.MipLevels > 1 { mip0 + mip0 / 7 } else { mip0 };
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 24 {
+                crate::xlog_info!("lab: 3-D texture at {va:#x} ({}x{}x{} format {} flags {flags:#x}) has no console size: taken as {bytes} bytes", pc.Width, pc.Height, pc.DepthOrArraySize, pc.Format.0);
+            }
+            Some(bytes)
+        });
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
