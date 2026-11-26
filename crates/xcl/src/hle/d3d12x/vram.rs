@@ -898,6 +898,21 @@ impl Pages {
         // lab (`XCL_BIND_LOG=1`): how a large texture gets its pages - which of them exist already
         // (shared by address or physical page with another texture: they keep what they hold)
         // and which are new (zeroed for a target with `XCL_ZERO_TARGET_PAGES`)
+        // (3-D textures of any size too, with their page keys: the colour LUTs are right after their
+        // bake and hold another LUT's rows by the present - run U1)
+        if lab_flag(&LAB_BIND_LOG, "XCL_BIND_LOG") && res.GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            static N3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N3.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600 {
+                let d = res.GetDesc();
+                let keys: Vec<String> = (0..(total as usize).min(12))
+                    .map(|i| if i < own { format!("{:#x}{}", page_key(first + i * PAGE, phys.get(i).copied().flatten()), if self.pages.contains_key(&page_key(first + i * PAGE, phys.get(i).copied().flatten())) { "*" } else { "" }) } else { format!("extra{}", if self.extra_pages.contains_key(&(va, i)) { "*" } else { "" }) })
+                    .collect();
+                crate::xlog_info!(
+                    "lab: bind 3-D {:p} at {va:#x}: {}x{}x{} format {} flags {:#x} console bytes {:?}, {total} tiles, first page {first:#x}, {own} owned, keys (* = exists already) {} at {:.1} s",
+                    res.as_raw(), d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Flags.0, console_bytes, keys.join(" "), crate::log::uptime()
+                );
+            }
+        }
         if total >= 64 && lab_flag(&LAB_BIND_LOG, "XCL_BIND_LOG") {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let d = res.GetDesc();

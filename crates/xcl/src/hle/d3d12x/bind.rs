@@ -2417,15 +2417,31 @@ unsafe fn pass_fill(this: *mut c_void, pso: usize) {
 /// slots of its tables (4 at most) is copied in the list to a texture of its own, which goes
 /// into the dump as kind `p`. The log line maps the copies to the pass and the slot.
 unsafe fn pass_snap(this: *mut c_void, pso: usize) {
-    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let set = SET.get_or_init(|| std::env::var("XCL_PASS_SNAP").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect());
+    // (`<hash>:t1[12]:t1[13]`: exactly these slots of the program's tables, whatever they hold -
+    // the automatic choice stops at the first 4 / 12 textures and names a texture by its first slot)
+    static SET: std::sync::OnceLock<Vec<(u64, Vec<(usize, usize)>)>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        std::env::var("XCL_PASS_SNAP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let mut f = e.trim().split(':');
+                let cs = u64::from_str_radix(f.next()?.trim(), 16).ok()?;
+                let slots = f
+                    .filter_map(|s| {
+                        let (t, k) = s.trim().strip_prefix('t')?.strip_suffix(']')?.split_once('[')?;
+                        Some((t.parse().ok()?, k.parse().ok()?))
+                    })
+                    .collect();
+                Some((cs, slots))
+            })
+            .collect()
+    });
     if set.is_empty() || !super::present::rt_dump_due_soon() {
         return;
     }
     let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
-    if !set.contains(&cs) {
-        return;
-    }
+    let Some((_, named)) = set.iter().find(|e| e.0 == cs) else { return };
     let now = crate::log::uptime();
     // (program, time) of the calls taken; the copies made, kept until their lists have long run
     static CALLS: Mutex<Vec<(u64, f64)>> = Mutex::new(Vec::new());
@@ -2467,20 +2483,22 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
             continue;
         }
         let t = u.base() + v as usize;
-        for k in 0..64usize {
+        let ks: Vec<usize> = if named.is_empty() { (0..64).collect() } else { named.iter().filter(|s| s.0 == ti).map(|s| s.1).collect() };
+        for k in ks {
             let slot = t + 32 * k;
-            if seen.len() >= most || !crate::gpu::shader::readable(slot, 32) {
+            if named.is_empty() && seen.len() >= most || !crate::gpu::shader::readable(slot, 32) {
                 break;
             }
             let w0 = (slot as *const u32).read_unaligned();
             let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
-            let Some(r) = r.filter(|&r| alive(r) && !seen.contains(&r)) else { continue };
+            let Some(r) = r.filter(|&r| alive(r) && (!named.is_empty() || !seen.contains(&r))) else { continue };
             let rr = r as *mut c_void;
             let Some(d) = ID3D12Resource::from_raw_borrowed(&rr).map(|x| x.GetDesc()) else { continue };
             let target = d.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0;
             let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || any && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
             let depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
-            if !shape || d.Width < least || d.SampleDesc.Count > 1 || !(target || any && !depth) {
+            let shape = shape || !named.is_empty() && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            if !shape || d.SampleDesc.Count > 1 || depth || named.is_empty() && (d.Width < least || !(target || any)) {
                 continue;
             }
             seen.push(r);
