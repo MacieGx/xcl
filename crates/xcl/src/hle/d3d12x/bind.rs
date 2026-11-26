@@ -896,6 +896,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     for &(res, plane) in &twins {
         super::list_x::depth_twin_fill(this, res, plane);
     }
+    if compute && !gfx {
+        pass_fill_at(this, pso, true);
+    }
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
@@ -2339,6 +2342,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     for &(res, plane) in &twins {
         super::list_x::depth_twin_fill(this, res, plane);
     }
+    pass_fill_at(this, pso, true);
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     for (res, plane) in twins {
@@ -2354,10 +2358,16 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// tables (numbered as the dispatch probe and the pass snapshots print them) are filled with the
 /// dword (default 0 = cleared). To take a pass's output out of the frame (its garbage with it),
 /// or to put a constant in its place (an R9G9B9E5 / R11G11B10 value as hex).
+/// `XCL_PASS_PREFILL` (the same form): the fill BEFORE each dispatch of the program - a marker in
+/// its outputs; a snapshot after the pass then shows which texels the pass wrote.
 unsafe fn pass_fill(this: *mut c_void, pso: usize) {
-    static SET: std::sync::OnceLock<Vec<(u64, Vec<(usize, usize, u32)>)>> = std::sync::OnceLock::new();
-    let set = SET.get_or_init(|| {
-        std::env::var("XCL_PASS_FILL")
+    pass_fill_at(this, pso, false)
+}
+
+unsafe fn pass_fill_at(this: *mut c_void, pso: usize, before: bool) {
+    static SETS: [std::sync::OnceLock<Vec<(u64, Vec<(usize, usize, u32)>)>>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let set = SETS[before as usize].get_or_init(|| {
+        std::env::var(if before { "XCL_PASS_PREFILL" } else { "XCL_PASS_FILL" })
             .unwrap_or_default()
             .split(',')
             .filter_map(|e| {
@@ -2404,7 +2414,7 @@ unsafe fn pass_fill(this: *mut c_void, pso: usize) {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 24 || n.is_power_of_two() {
-            crate::xlog_info!("pass fill #{n}: cs {cs:016x} t{ti}[{k}] {:#x} with {pat:#010x} at {:.1} s: {}", r.unwrap_or(0), crate::log::uptime(), if done { "done" } else { "NOT done" });
+            crate::xlog_info!("pass {}fill #{n}: cs {cs:016x} t{ti}[{k}] {:#x} with {pat:#010x} at {:.1} s: {}", if before { "pre" } else { "" }, r.unwrap_or(0), crate::log::uptime(), if done { "done" } else { "NOT done" });
         }
     }
 }
@@ -2448,7 +2458,8 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
     static KEPT: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
     let call = {
         let mut g = CALLS.lock().unwrap();
-        g.retain(|&(_, t)| now - t < 4.0);
+        // (the first call of a frame: a present between the copy and the dump lets the set go)
+        g.retain(|&(_, t)| now - t < 0.3);
         let n = g.iter().filter(|c| c.0 == cs).count();
         if n >= 1 {
             return;
