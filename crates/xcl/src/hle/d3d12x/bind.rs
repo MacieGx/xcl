@@ -119,6 +119,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// previous recording's memory is the previous allocator's until the GPU is done with it, and
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    super::indirect_clamp::list_reset(list as usize);
     let (old, blocks, res_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -701,8 +702,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // (#1798: a graphics pipeline still being built is not waited for; a compute one is)
     let pso = pso_for_draw(raw_pso);
     // (any other ExecuteIndirect ends a run of two-pass ones: a dispatch may write their records)
-    if super::clamp_runs::on() && !(super::real::two_pass_of(pso).is_some() && dispatch_mesh_sig_of(sig).is_some()) {
+    if (super::clamp_runs::on() || super::indirect_clamp::batch_on()) && !(super::real::two_pass_of(pso).is_some() && dispatch_mesh_sig_of(sig).is_some()) {
         super::clamp_runs::write(this as usize);
+        super::indirect_clamp::run_stop(this as usize);
     }
     let (console_args_off, console_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -724,7 +726,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // lab: `XCL_TWO_PASS_UNBOUNDED=1`: the passes read the title's records as they are
             static UNBOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let unbounded = *UNBOUNDED.get_or_init(|| std::env::var_os("XCL_TWO_PASS_UNBOUNDED").is_some());
-            let bounded = if unbounded { None } else { super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget) };
+            let bounded = if unbounded { None } else { super::indirect_clamp::bound_in_run(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget) };
             if bounded.is_none() && !unbounded {
                 // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
                 ei_work(this, sig, super::targets::SKIPPED);
@@ -739,6 +741,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 Some(b) => (b.raw(), b.offset()),
                 None => (args, args_off),
             };
+            // a run's copy (`XCL_CLAMP_BATCH`) holds the count too, and has been readable since
+            // the run's pass: its calls need no wait of their own
+            let (count_buf, count_off) = match bounded.as_ref().and_then(|b| b.count().map(|at| (b.raw(), at))) {
+                Some(c) => c,
+                None => (count_buf, count_off),
+            };
+            let in_run = bounded.as_ref().is_some_and(|b| b.batched());
+            let ordered = |op: &dyn Fn()| if in_run { op() } else { fresh_indirect_arguments(this, || op()) };
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             // lab: the groups of a single record as the CPU sees them now (a record the GPU
             // writes later may differ): the record buffer is made for them when they need more
@@ -779,7 +789,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 // both passes read the records a dispatch before them wrote (the title's own, or
                 // the bounded copy): ordered after those writes as any other ExecuteIndirect is
                 // (`fresh_indirect_arguments`; NVIDIA runs the old records otherwise)
-                fresh_indirect_arguments(this, || pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off));
+                ordered(&|| pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off));
                 emit_uav_barrier(list, Some(&res_buf));
                 {
                     // lab: record 0 as the compute pass left it (kind 4: vertices, primitives, spare; 5/6/7: position of vertex 0/1/2, w as the "count")
@@ -795,7 +805,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     fresh_indirect_arguments(this, || pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off));
                 } else {
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+                    ordered(&|| pc(this, sig, max, args, args_off, count_buf, count_off));
                 }
                 emit_uav_barrier(list, Some(&res_buf));
                 Ok(())
@@ -2463,6 +2473,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     dispatch_probe(this, pso, [x, y, z]);
     super::clamp_runs::write(this as usize);
+    super::indirect_clamp::run_stop(this as usize);
     rt_dump_note_compute(this);
     let twins = depth_twins_named(this);
     for &(res, plane) in &twins {
