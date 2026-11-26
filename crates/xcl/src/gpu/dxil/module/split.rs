@@ -772,7 +772,7 @@ mod tests {
         let split = threads == 64;
         let cs = CsInterface { threads: geometry, ..Default::default() };
         let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
-        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs), false);
         let (tid, _) = lw.setup_lanes_compute(geometry, false);
         let mem = lw.mems[0];
         let group = lw.s.group_id(0);
@@ -878,7 +878,7 @@ mod tests {
         let geometry = [32, 1, 1];
         let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
         let cs = CsInterface { threads: geometry, ..Default::default() };
-        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs), false);
         let (tid, _) = lw.setup_lanes_compute(geometry, false);
         let mem = lw.mems[0];
         let offset = lw.shlc(tid, 2);
@@ -943,7 +943,7 @@ mod tests {
         let geometry = [32, 1, 1];
         let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
         let cs = CsInterface { threads: geometry, ..Default::default() };
-        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs), false);
         let (tid, _) = lw.setup_lanes_compute(geometry, false);
         let mem = lw.mems[0];
         let offset = lw.shlc(tid, 2);
@@ -1007,7 +1007,7 @@ mod tests {
             let split = threads == 64;
             let cs = CsInterface { threads: geometry, ..Default::default() };
             let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
-            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs), false);
             let (tid, _) = lw.setup_lanes_compute(geometry, false);
             let mem = lw.mems[0];
             let [x, y, z] = [0, 1, 2].map(|axis| lw.s.group_id(axis));

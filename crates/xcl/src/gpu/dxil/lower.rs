@@ -32,6 +32,8 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
+/// this hardware wave has left the safe `s_barrier`'s live count (`xcl_bar_alive` false; `group_barrier`)
+pub const VAR_BAR_DEAD: u32 = VAR_BUDGET + 6;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -120,7 +122,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_BAR_DEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -273,6 +275,10 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// how `s_barrier` is lowered (`group_barrier`) and, for the safe barrier, its two
+    /// group-shared words (`alive`, `state`: storage and index of `alive`)
+    pub sbar: super::group_barrier::SBarrier,
+    pub bar: Option<(super::ops::GroupShared, u32)>,
 }
 
 impl Lw {
@@ -1025,7 +1031,7 @@ impl Lw {
     fn sopp(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         match name {
             "s_barrier" => {
-                self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                self.s_barrier();
                 Ok(())
             }
             "s_round_mode" => {
@@ -2114,7 +2120,7 @@ mod saveexec_tests {
         let insts = [rdna2::decode(code, 0).expect("decode saveexec/wrexec")];
         let leaders: BTreeSet<u64> = [0].into_iter().collect();
         let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
-        let mut lw = Lw::new(&insts, &leaders, ko, &Entry::Kernel);
+        let mut lw = Lw::new(&insts, &leaders, ko, &Entry::Kernel, false);
         lw.inst(&insts[0]).expect("lower single saveexec/wrexec");
         lw.init.touched
     }

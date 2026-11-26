@@ -133,7 +133,7 @@ fn branches_to_many_places_keep_their_target_in_the_entry() {
     let cfg = super::cfg::Cfg::build(&code).unwrap();
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel, false);
     let p = super::compact::plan(&cfg, &lw).unwrap();
     assert_eq!((p.order.len(), p.steps.len()), (1002, 1002));
     assert!(p.words() < 500, "{} words", p.words());
@@ -175,7 +175,7 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     let cfg = super::cfg::Cfg::build(&v).unwrap();
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel, false);
     let p = super::compact::plan(&cfg, &lw).unwrap();
     assert_eq!(p.order.len(), 4);
     assert_ne!(p.class[0], p.class[2]);
@@ -229,7 +229,7 @@ fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
     let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
     let cfg = super::cfg::Cfg::build(&code).unwrap();
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel, false);
     let p = super::compact::automatic_plan(&cfg, &lw, false, super::compact::TABLE_WORDS_WAVE32).unwrap();
     assert!(p.inline && p.words() > 8192 && p.words() <= 12288);
     let k = translate_full(&code, o).unwrap();
@@ -327,7 +327,7 @@ fn nested_compact_ir_structure_bounds_switch_fanout_and_merge_fanin() {
     let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
 
     let inspect = |nest: Nest| -> (usize, usize, usize, usize) {
-        let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+        let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel, false);
         lw.setup_lanes();
         let lane = lw.lane;
         let k = lw.c((crate::gpu::recomp::KERNEL_VGPRS * 4) as u32);
