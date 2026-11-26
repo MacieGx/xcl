@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+mod clamp_runs;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -23,6 +24,7 @@ mod indirect_clamp;
 pub mod frame;
 pub mod guard;
 mod late_release;
+mod look_join;
 pub mod layout;
 pub mod list_x;
 pub mod null;
@@ -35,8 +37,10 @@ mod targets;
 mod standin;
 pub mod title_list;
 pub mod view_mem;
+mod submit_cost;
 pub mod title_textures;
 pub mod vram;
+mod worker_pool;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

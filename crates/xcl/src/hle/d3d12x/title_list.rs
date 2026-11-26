@@ -142,6 +142,7 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     }
     // a new recording starts at Reset
     *((this as usize + F_RING_AT) as *mut usize) = 0;
+    super::look_join::note_list_closed(this as usize);
     hr
 }
 

@@ -3288,6 +3288,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
+    super::look_join::note_list_closed(this as usize);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -8497,6 +8498,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let submit_t0 = std::time::Instant::now();
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -8521,13 +8523,16 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
     removed_probe("execute: after refresh");
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         removed_probe("execute: before the PC call");
         let _ = super::alloc_pool::note_resubmits(this, chunk);
+        let t = std::time::Instant::now();
         f(this, chunk.len() as u32, chunk.as_ptr());
+        let t1 = std::time::Instant::now();
+        super::submit_cost::driver(t1 - t);
         removed_probe("execute: after the PC call");
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
@@ -8537,12 +8542,14 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         removed_probe("execute: after readback_sparse_writes");
         super::list_x::cpu_writes_after(this, chunk);
         removed_probe("execute: after cpu_writes_after");
+        super::submit_cost::after(t1.elapsed());
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     removed_probe("execute: end");
     stop_if_device_removed();
+    super::submit_cost::done(submit_t0);
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
