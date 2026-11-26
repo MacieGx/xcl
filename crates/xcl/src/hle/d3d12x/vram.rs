@@ -925,9 +925,16 @@ impl Pages {
                 let new: Vec<usize> = (0..total as usize)
                     .filter(|&i| if i < own { !self.pages.contains_key(&page_key(first + i * PAGE, phys.get(i).copied().flatten())) } else { !self.extra_pages.contains_key(&(va, i)) })
                     .collect();
+                // who holds the pages that exist already: (target, its address, pages in common), most first
+                let mine: std::collections::HashSet<usize> = (0..own).map(|i| page_key(first + i * PAGE, phys.get(i).copied().flatten())).collect();
+                let mut with: Vec<(usize, usize, usize)> = self.targets.iter().filter(|(&r, _)| r != res.as_raw() as usize).map(|(&r, t)| (r, t.va, t.used.iter().filter(|k| mine.contains(k)).count())).filter(|x| x.2 > 0).collect();
+                with.sort_by_key(|x| std::cmp::Reverse(x.2));
+                let with: Vec<String> = with.iter().take(4).map(|(r, a, n)| format!("{n} with {r:#x} at {a:#x}")).collect();
+                let key = |i: usize| page_key(first + i * PAGE, phys.get(i).copied().flatten());
                 crate::xlog_info!(
-                    "lab: bind {:p} at {va:#x}: {}x{} format {} flags {:#x}, {total} tiles, {own} owned pages ({by_phys} keyed by physical page), {missing} new (first {:?}, last {:?}) at {:.1} s",
-                    res.as_raw(), d.Width, d.Height, d.Format.0, d.Flags.0, new.first(), new.last(), crate::log::uptime()
+                    "lab: bind {:p} at {va:#x}: {}x{} format {} flags {:#x}, {total} tiles, {own} owned pages ({by_phys} keyed by physical page), {missing} new (first {:?}, last {:?}) at {:.1} s; keys {:#x}..{:#x}; shares {}",
+                    res.as_raw(), d.Width, d.Height, d.Format.0, d.Flags.0, new.first(), new.last(), crate::log::uptime(),
+                    if own > 0 { key(0) } else { 0 }, if own > 0 { key(own - 1) } else { 0 }, if with.is_empty() { "nothing".to_string() } else { with.join(", ") }
                 );
             }
         }

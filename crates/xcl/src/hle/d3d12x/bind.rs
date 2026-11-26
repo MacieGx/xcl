@@ -2459,7 +2459,8 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
     let call = {
         let mut g = CALLS.lock().unwrap();
         // (the first call of a frame: a present between the copy and the dump lets the set go)
-        g.retain(|&(_, t)| now - t < 0.3);
+        // (4 s: one set a dump. Once a frame (0.3 s) ended run Q1 in the driver at the dump)
+        g.retain(|&(_, t)| now - t < 4.0);
         let n = g.iter().filter(|c| c.0 == cs).count();
         if n >= 1 {
             return;
