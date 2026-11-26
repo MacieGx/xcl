@@ -2291,6 +2291,28 @@ unsafe fn make_copy_scratch(list: *mut c_void, bytes: u64) -> Option<ID3D12Resou
     b
 }
 
+/// lab (`XCL_PASS_SNAP`, `bind::pass_snap`): a copy of mip 0 of the texture `res` as it is at this
+/// point of the list (a new texture; the caller keeps it alive until the list has run). The source
+/// is copied in whatever state it is in, as the alias copies are.
+pub(super) unsafe fn pass_snapshot(list: *mut c_void, res: usize) -> Option<usize> {
+    let r = res as *mut c_void;
+    let d = ID3D12Resource::from_raw_borrowed(&r)?.GetDesc();
+    let dev = device_of(list)?;
+    let td = D3D12_RESOURCE_DESC { MipLevels: 1, DepthOrArraySize: 1, Flags: D3D12_RESOURCE_FLAG_NONE, Alignment: 0, ..d };
+    let mut snap: Option<ID3D12Resource> = None;
+    super::title_textures::own_work(|| dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut snap)).ok()?;
+    let snap = snap?.into_raw() as usize;
+    let sub_of = |r: usize| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+    // (a UAV barrier first: the pass's writes are done before the copy reads)
+    let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
+    let (dl, sl) = (sub_of(snap), sub_of(res));
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, &dl, 0, 0, 0, &sl, std::ptr::null());
+    std::mem::forget((dl, sl));
+    transition(list, snap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Some(snap)
+}
+
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
     let mut dev: Option<ID3D12Device> = None;
     ID3D12GraphicsCommandList::from_raw_borrowed(&list)?.GetDevice(&mut dev).ok()?;

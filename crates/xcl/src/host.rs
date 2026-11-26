@@ -276,6 +276,32 @@ pub fn host_main(boot_path: &Path) -> i32 {
         let ok = unsafe { SetProcessWorkingSetSizeEx(windows_sys::Win32::System::Threading::GetCurrentProcess() as *mut _, 256 << 20, mb << 20, 2 | 4) };
         crate::xlog_info!("memory lab: working set limited to {mb} MB (XCL_WS_MAX_MB): {}", if ok != 0 { "set".to_string() } else { format!("failed, {}", std::io::Error::last_os_error()) });
     }
+    // lab: `XCL_MIN_FREE_MB=n` – the process ends itself when the PC's free RAM is under n MB at
+    // four readings in a row (2 s) or under n / 2 MB once. The lab harness has this guard in a
+    // PowerShell process, and that process was ended from outside twice (runs G2 / G3) while the
+    // title ran on: this one lives and dies with the title.
+    if let Some(mb) = std::env::var("XCL_MIN_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0) {
+        let _ = std::thread::Builder::new().name("xcl-ram-guard".into()).spawn(move || {
+            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+            crate::xlog_info!("memory lab: the process ends itself under {mb} MB of free RAM (XCL_MIN_FREE_MB)");
+            let mut low = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+                m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+                if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+                    continue;
+                }
+                let free = m.ullAvailPhys >> 20;
+                low = if free < mb { low + 1 } else { 0 };
+                if low >= 4 || free < mb / 2 {
+                    crate::xlog_error!("XCL_MIN_FREE_MB: {free} MB of RAM free (limit {mb} MB) – the process ends itself");
+                    crate::log::flush();
+                    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 0xE000_0001) };
+                }
+            }
+        });
+    }
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
         let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();

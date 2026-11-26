@@ -907,6 +907,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         for (res, plane) in twins {
             super::list_x::depth_twin_flush(this, res, plane);
         }
+        if compute && !gfx {
+            pass_snap(this, pso);
+        }
     }
     if let Some(b) = bounded {
         b.finish(list);
@@ -2340,7 +2343,85 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);
     }
+    pass_snap(this, pso);
     Ok(())
+}
+
+/// lab: `XCL_PASS_SNAP=<cs record hash>,...` (hex; with `XCL_RT_DUMP`) - what the large targets a
+/// compute pass names hold RIGHT AFTER that pass, not at the present (the title places several
+/// transient targets at one address: at the present a target shows whatever used its memory
+/// last). Within a second before a dump is due, after the first dispatch of a named
+/// program: every single-sampled 2-D colour / UAV target at least 1280 wide in the first 64
+/// slots of its tables (4 at most) is copied in the list to a texture of its own, which goes
+/// into the dump as kind `p`. The log line maps the copies to the pass and the slot.
+unsafe fn pass_snap(this: *mut c_void, pso: usize) {
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| std::env::var("XCL_PASS_SNAP").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect());
+    if set.is_empty() || !super::present::rt_dump_due_soon() {
+        return;
+    }
+    let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
+    if !set.contains(&cs) {
+        return;
+    }
+    let now = crate::log::uptime();
+    // (program, time) of the calls taken; the copies made, kept until their lists have long run
+    static CALLS: Mutex<Vec<(u64, f64)>> = Mutex::new(Vec::new());
+    static KEPT: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+    let call = {
+        let mut g = CALLS.lock().unwrap();
+        g.retain(|&(_, t)| now - t < 4.0);
+        let n = g.iter().filter(|c| c.0 == cs).count();
+        if n >= 1 {
+            return;
+        }
+        g.push((cs, now));
+        n
+    };
+    {
+        let mut g = KEPT.lock().unwrap();
+        let old: Vec<usize> = g.iter().filter(|&&(_, t)| now - t > 30.0).map(|&(r, _)| r).collect();
+        g.retain(|&(_, t)| now - t <= 30.0);
+        for r in old {
+            drop(ID3D12Resource::from_raw(r as *mut c_void));
+        }
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+    let mut seen: Vec<usize> = Vec::new();
+    let mut ti = 0;
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let v = word(at as usize).unwrap_or(0);
+        if v == 0 {
+            continue;
+        }
+        let t = u.base() + v as usize;
+        for k in 0..64usize {
+            let slot = t + 32 * k;
+            if seen.len() >= 4 || !crate::gpu::shader::readable(slot, 32) {
+                break;
+            }
+            let w0 = (slot as *const u32).read_unaligned();
+            let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
+            let Some(r) = r.filter(|&r| alive(r) && !seen.contains(&r)) else { continue };
+            let rr = r as *mut c_void;
+            let Some(d) = ID3D12Resource::from_raw_borrowed(&rr).map(|x| x.GetDesc()) else { continue };
+            let target = d.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0;
+            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 1280 || d.SampleDesc.Count > 1 || !target {
+                continue;
+            }
+            seen.push(r);
+            let Some(snap) = super::list_x::pass_snapshot(this, r) else { continue };
+            KEPT.lock().unwrap().push((snap, now));
+            super::present::note_rt_dump(snap, b'p');
+            crate::xlog_info!("pass snap: cs {cs:016x} call {call} at {now:.2} s: t{ti}[{k}] {r:#x} {}x{} f{} copied to {snap:#x}", d.Width, d.Height, d.Format.0);
+        }
+        ti += 1;
+    }
 }
 
 /// The CPU addresses of the descriptor tables root arguments `args` of `layout` bind (32-bit

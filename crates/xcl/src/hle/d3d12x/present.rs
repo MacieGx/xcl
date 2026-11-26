@@ -1037,14 +1037,19 @@ pub unsafe fn note_rt_dump(res: usize, kind: u8) {
         return;
     }
     // lab: `XCL_RT_DUMP_ONLY`: only what the named compute passes name (kind `o`)
-    if !rt_dump_only().is_empty() && kind != b'o' {
+    // (kind `p`: a pass snapshot, `XCL_PASS_SNAP` - always, and first: the dump stops at 300 textures)
+    if !rt_dump_only().is_empty() && kind != b'o' && kind != b'p' {
         return;
     }
     let mut g = RT_DUMP_SET.lock().unwrap();
-    if g.len() >= 400 || g.iter().any(|&(r, _)| r == res) {
+    if g.len() >= if kind == b'p' { 480 } else { 400 } || g.iter().any(|&(r, _)| r == res) {
         return;
     }
     add_ref(res);
+    if kind == b'p' {
+        g.insert(0, (res, kind));
+        return;
+    }
     g.push((res, kind));
 }
 
