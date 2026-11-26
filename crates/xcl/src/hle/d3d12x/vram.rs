@@ -902,7 +902,10 @@ impl Pages {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let d = res.GetDesc();
             // (screen-sized textures only, from the world on: the menus' streamed textures used the lines up)
-            if d.Width >= 1280 && d.Height >= 720 && crate::log::uptime() > 60.0 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3000 {
+            // targets of 1280 or wider always; flag-less textures only at screen sizes (the streamed 2048 / 4096 ones used the lines up)
+            let target = d.Flags.0 & 0x7 != 0;
+            let screen = d.Width >= 1280 && d.Width <= 2560 && d.Height >= 720 && d.Height <= 1440 && crate::log::uptime() > 60.0;
+            if (target && d.Width >= 1280 || !target && screen) && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3000 {
                 let by_phys = (0..own).filter(|&i| phys.get(i).copied().flatten().is_some()).count();
                 let new: Vec<usize> = (0..total as usize)
                     .filter(|&i| if i < own { !self.pages.contains_key(&page_key(first + i * PAGE, phys.get(i).copied().flatten())) } else { !self.extra_pages.contains_key(&(va, i)) })
