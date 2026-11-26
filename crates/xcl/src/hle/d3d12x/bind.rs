@@ -2453,6 +2453,11 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
     let Some(layout) = layout else { return };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+    // `XCL_PASS_SNAP_ANY=1`: every 2-D / 3-D texture at least 16 wide, a target or not (12 at most):
+    // for small passes (the colour LUT bakes and what they read)
+    static ANY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let any = *ANY.get_or_init(|| std::env::var("XCL_PASS_SNAP_ANY").is_ok_and(|v| v.trim() == "1"));
+    let (most, least) = if any { (12, 16) } else { (4, 1280) };
     let mut seen: Vec<usize> = Vec::new();
     let mut ti = 0;
     for p in layout.params.iter() {
@@ -2464,7 +2469,7 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
         let t = u.base() + v as usize;
         for k in 0..64usize {
             let slot = t + 32 * k;
-            if seen.len() >= 4 || !crate::gpu::shader::readable(slot, 32) {
+            if seen.len() >= most || !crate::gpu::shader::readable(slot, 32) {
                 break;
             }
             let w0 = (slot as *const u32).read_unaligned();
@@ -2473,14 +2478,16 @@ unsafe fn pass_snap(this: *mut c_void, pso: usize) {
             let rr = r as *mut c_void;
             let Some(d) = ID3D12Resource::from_raw_borrowed(&rr).map(|x| x.GetDesc()) else { continue };
             let target = d.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0;
-            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 1280 || d.SampleDesc.Count > 1 || !target {
+            let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || any && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            let depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+            if !shape || d.Width < least || d.SampleDesc.Count > 1 || !(target || any && !depth) {
                 continue;
             }
             seen.push(r);
             let Some(snap) = super::list_x::pass_snapshot(this, r) else { continue };
             KEPT.lock().unwrap().push((snap, now));
             super::present::note_rt_dump(snap, b'p');
-            crate::xlog_info!("pass snap: cs {cs:016x} call {call} at {now:.2} s: t{ti}[{k}] {r:#x} {}x{} f{} copied to {snap:#x}", d.Width, d.Height, d.Format.0);
+            crate::xlog_info!("pass snap: cs {cs:016x} call {call} at {now:.2} s: t{ti}[{k}] {r:#x} {}x{} f{} copied to {snap:#x}{}", d.Width, d.Height, d.Format.0, if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!(" (3-D, {} slices)", d.DepthOrArraySize) } else { String::new() });
         }
         ti += 1;
     }

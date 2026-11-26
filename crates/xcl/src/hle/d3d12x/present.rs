@@ -760,7 +760,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             // lab (`XCL_POST_PROBE`): kind `s` = sampled by the tone-map draw: whatever its size.
             // A 3-D texture (the colour LUTs): its first slice. A 1x1 / 2x2 target (the exposure) always.
             let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || (kind == b's' && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D);
-            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u' && kind != b'o';
+            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u' && kind != b'o' && kind != b'p';
             if !shape || d.SampleDesc.Count > 1 || small || taken >= 300 || bytes > 1000 << 20 {
                 crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
                 continue;
@@ -1042,11 +1042,13 @@ pub unsafe fn note_rt_dump(res: usize, kind: u8) {
         return;
     }
     let mut g = RT_DUMP_SET.lock().unwrap();
-    if g.len() >= if kind == b'p' { 480 } else { 400 } || g.iter().any(|&(r, _)| r == res) {
+    // (kind `s`, what the tone-map draw samples, likewise: it is the frame's last draw and found the set full)
+    let first = kind == b'p' || kind == b's';
+    if g.len() >= if first { 480 } else { 400 } || g.iter().any(|&(r, _)| r == res) {
         return;
     }
     add_ref(res);
-    if kind == b'p' {
+    if first {
         g.insert(0, (res, kind));
         return;
     }

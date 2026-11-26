@@ -2298,7 +2298,9 @@ pub(super) unsafe fn pass_snapshot(list: *mut c_void, res: usize) -> Option<usiz
     let r = res as *mut c_void;
     let d = ID3D12Resource::from_raw_borrowed(&r)?.GetDesc();
     let dev = device_of(list)?;
-    let td = D3D12_RESOURCE_DESC { MipLevels: 1, DepthOrArraySize: 1, Flags: D3D12_RESOURCE_FLAG_NONE, Alignment: 0, ..d };
+    // (a 3-D texture keeps its slices: mip 0 is one subresource)
+    let depth = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { d.DepthOrArraySize } else { 1 };
+    let td = D3D12_RESOURCE_DESC { MipLevels: 1, DepthOrArraySize: depth, Flags: D3D12_RESOURCE_FLAG_NONE, Alignment: 0, ..d };
     let mut snap: Option<ID3D12Resource> = None;
     super::title_textures::own_work(|| dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut snap)).ok()?;
     let snap = snap?.into_raw() as usize;

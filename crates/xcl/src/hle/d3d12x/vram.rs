@@ -179,6 +179,7 @@ const EVICT_BATCH: usize = 512;
 const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 static LAB_EVICT_SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static LAB_BIND_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static LAB_SEEN_NO_TOUCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// lab: `XCL_EVICT_SHARED=1` (textures whose pages are all shared are evicted too: a group of
 /// them over the same pages was never evicted), `XCL_SEEN_TOUCH=0` (see `seen`): the variable
@@ -894,6 +895,24 @@ impl Pages {
             (missing, preferred)
         };
         let (mut missing, mut preferred) = count(self);
+        // lab (`XCL_BIND_LOG=1`): how a large texture gets its pages - which of them exist already
+        // (shared by address or physical page with another texture: they keep what they hold)
+        // and which are new (zeroed for a target with `XCL_ZERO_TARGET_PAGES`)
+        if total >= 64 && lab_flag(&LAB_BIND_LOG, "XCL_BIND_LOG") {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let d = res.GetDesc();
+            // (screen-sized textures only, from the world on: the menus' streamed textures used the lines up)
+            if d.Width >= 1280 && d.Height >= 720 && crate::log::uptime() > 60.0 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3000 {
+                let by_phys = (0..own).filter(|&i| phys.get(i).copied().flatten().is_some()).count();
+                let new: Vec<usize> = (0..total as usize)
+                    .filter(|&i| if i < own { !self.pages.contains_key(&page_key(first + i * PAGE, phys.get(i).copied().flatten())) } else { !self.extra_pages.contains_key(&(va, i)) })
+                    .collect();
+                crate::xlog_info!(
+                    "lab: bind {:p} at {va:#x}: {}x{} format {} flags {:#x}, {total} tiles, {own} owned pages ({by_phys} keyed by physical page), {missing} new (first {:?}, last {:?}) at {:.1} s",
+                    res.as_raw(), d.Width, d.Height, d.Format.0, d.Flags.0, new.first(), new.last(), crate::log::uptime()
+                );
+            }
+        }
 
         if self.cap > 0 && self.pools.len() >= self.cap && missing > 0 {
             // page budget: rounds of `EVICT_BATCH` tiles give tiles back (to `cooling`), which this
@@ -1060,7 +1079,12 @@ fn page_key(a: usize, phys: Option<usize>) -> usize {
 /// The physical pages under a GPU-owned texture's owned pages (`require_aligned`), asked before
 /// `PAGES` is taken; empty for others (keyed by address) and without the console size.
 fn physical_pages_under(va: usize, console_bytes: Option<u64>, require_aligned: bool) -> Vec<Option<usize>> {
-    if !require_aligned {
+    // lab (`XCL_PHYS_KEYS_ALL=1`, the haze investigator's reading of G4): a texture WITHOUT target
+    // flags at a page-aligned address is keyed by physical page too. Keyed by address it shares
+    // with a flagged texture at its address only the pages that are at home: the reader of a
+    // UAV-texture / sampled-texture pair saw its writer in part of the tiles only.
+    static LAB_PHYS_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !require_aligned && !(va % PAGE == 0 && lab_flag(&LAB_PHYS_ALL, "XCL_PHYS_KEYS_ALL")) {
         return Vec::new();
     }
     match console_bytes.and_then(|b| owned_pages(va, Some(b), usize::MAX)) {
