@@ -87,25 +87,52 @@ pub(super) fn look_begins() {
 /// Whether a look that began at `began` and ended at `ended` took all that submits of lists
 /// closed at `closed` read (None: a list not seen closing), asked at `now`.
 fn covers(began: u64, ended: u64, walk_found: u64, now: u64, window: u64, closed: impl IntoIterator<Item = Option<u64>>) -> bool {
+    why_not(began, ended, walk_found, now, window, closed) == COVERED
+}
+
+/// What `why_not` answers: covered, or the first reason it is not.
+const COVERED: usize = 0;
+const NO_LOOK: usize = 1;
+const WALK: usize = 2;
+const WINDOW: usize = 3;
+const UNSEEN: usize = 4;
+/// a list closed while the last look ran, or after it ended
+const DURING: usize = 5;
+const AFTER: usize = 6;
+
+fn why_not(began: u64, ended: u64, walk_found: u64, now: u64, window: u64, closed: impl IntoIterator<Item = Option<u64>>) -> usize {
     if began == 0 || ended < began {
-        return false;
+        return NO_LOOK;
     }
     // a block the walk found written since: the look did not take it
     if walk_found >= began {
-        return false;
-    }
-    if window != 0 && now.saturating_sub(ended) > window {
-        return false;
+        return WALK;
     }
     let mut any = false;
+    let mut late = COVERED;
     for t in closed {
         any = true;
-        if !t.is_some_and(|t| t < began) {
-            return false;
+        match t {
+            None => return UNSEEN,
+            Some(t) if t >= ended => late = AFTER,
+            Some(t) if t >= began && late == COVERED => late = DURING,
+            _ => {}
         }
     }
-    any
+    if !any {
+        return UNSEEN;
+    }
+    if late != COVERED {
+        return late;
+    }
+    if window != 0 && now.saturating_sub(ended) > window {
+        return WINDOW;
+    }
+    COVERED
 }
+
+/// submits by `why_not`
+static WHY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Whether the last look took what the title's submit of `lists` (its own pointers) reads. Asked
 /// with the refresh lock held: the look before is done and its uploads are submitted.
@@ -115,14 +142,16 @@ pub(super) fn covered(lists: &[*mut std::ffi::c_void]) -> bool {
     }
     let g = CLOSED.lock().unwrap();
     let Some(m) = g.as_ref() else { return false };
-    covers(
+    let why = why_not(
         LOOK[0].load(Ordering::Acquire),
         LOOK[1].load(Ordering::Acquire),
         WALK_FOUND.load(Ordering::Acquire),
         now_us(),
         window_us(),
         lists.iter().map(|&l| m.get(&(l as usize)).copied()),
-    )
+    );
+    WHY[why].fetch_add(1, Ordering::Relaxed);
+    why == COVERED
 }
 
 /// Whether a submit the last look covers goes without a look of its own.
@@ -160,6 +189,14 @@ pub(super) fn submit_done(covered: bool, look: Option<(std::time::Duration, usiz
     let now: [u64; 7] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let d = |i: usize| now[i].saturating_sub(last[i]);
     let covered_now = c.saturating_sub(last[1]);
+    {
+        // (so far, not of the last 1024: the shares are what matters)
+        let w: [u64; 7] = std::array::from_fn(|i| WHY[i].load(Ordering::Relaxed));
+        crate::xlog_info!(
+            "D3D12.X: look join, submits with lists so far: {} covered by the last look; not covered: {} had a list closed while it ran, {} one closed after it ended, {} came later than the time bound, {} had a list not seen closing, {} no finished look, {} a block the walk found",
+            w[COVERED], w[DURING], w[AFTER], w[WINDOW], w[UNSEEN], w[NO_LOOK], w[WALK]
+        );
+    }
     let window = match window_us() {
         0 => "no time bound".to_string(),
         w => format!("within {} ms of it", w / 1000),
@@ -229,6 +266,23 @@ mod tests {
         assert!(!covers(100, 150, 0, 4151, 4000, [Some(99)]));
         // no bound
         assert!(covers(100, 150, 0, 10_000_000, 0, [Some(99)]));
+    }
+
+    #[test]
+    fn a_submit_that_is_not_covered_says_why() {
+        // look from 100 to 150
+        let w = |now: u64, window: u64, closed: &[Option<u64>]| why_not(100, 150, 0, now, window, closed.iter().copied());
+        assert_eq!(w(160, 0, &[Some(99)]), COVERED);
+        assert_eq!(w(160, 0, &[Some(99), Some(120)]), DURING);
+        assert_eq!(w(160, 0, &[Some(120), Some(155)]), AFTER);
+        assert_eq!(w(160, 0, &[Some(155), Some(120)]), AFTER);
+        assert_eq!(w(160, 0, &[Some(99), None]), UNSEEN);
+        assert_eq!(w(160, 0, &[]), UNSEEN);
+        // the time bound is the reason only when the lists were closed in time
+        assert_eq!(w(5000, 4000, &[Some(99)]), WINDOW);
+        assert_eq!(w(5000, 4000, &[Some(120)]), DURING);
+        assert_eq!(why_not(0, 0, 0, 10, 0, [Some(1)]), NO_LOOK);
+        assert_eq!(why_not(100, 150, 120, 160, 0, [Some(1)]), WALK);
     }
 
     #[test]
