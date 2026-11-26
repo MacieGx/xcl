@@ -147,6 +147,41 @@ struct Table {
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
+    /// lab (`texture_index`): the active textures by the 2 MiB pieces of their source
+    /// (`Entry::src`); may name textures that went or moved (a submit checks each it names)
+    src_pieces: BTreeMap<usize, Vec<usize>>,
+    /// lab (`texture_index`): textures that became pending since the last submit (may name ones
+    /// that went or are shadowed)
+    pending_res: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `texture_index` for the tests of this thread
+    static FORCE_INDEX: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// the piece (2 MiB) of an address, for `Table::src_pieces`
+const SRC_PIECE_SHIFT: usize = 21;
+
+/// lab: `XCL_TEXTURE_INDEX=1` (off unless set): a submit checks the textures whose source lies
+/// under its written pages (by 2 MiB piece) and those made pending since the last one, not all
+/// of them – a retail title keeps ~65,000 in step, and going through all of them took 1.1 ms of
+/// every submit (lab run R1c, "texture filter"). `=2`: both ways, the full one's result is used,
+/// and a texture the index missed is logged (a check for the index). After nvidia-dev 9acc0314
+/// (theaustinayers; 1 MiB pieces, kept exactly) – here the index is a superset kept where
+/// textures are made active, uncovered, moved or made pending.
+fn texture_index() -> u8 {
+    #[cfg(test)]
+    if let m @ 1.. = FORCE_INDEX.with(|f| f.get()) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_TEXTURE_INDEX").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 impl Table {
@@ -158,7 +193,70 @@ impl Table {
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
+            src_pieces: BTreeMap::new(),
+            pending_res: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// `texture_index`: `res` (active now, `e` its entry) is found by the pieces of its source,
+    /// and among the pending when it is.
+    fn link(&mut self, res: usize, e: &Entry) {
+        if texture_index() == 0 {
+            return;
+        }
+        for (s, end) in e.src.ranges(e.tex.size() as usize) {
+            for p in (s >> SRC_PIECE_SHIFT)..=(end.max(s + 1) - 1) >> SRC_PIECE_SHIFT {
+                let v = self.src_pieces.entry(p).or_default();
+                if !v.contains(&res) {
+                    v.push(res);
+                }
+            }
+        }
+        if e.pending {
+            self.pending_res.insert(res);
+        }
+    }
+
+    /// `texture_index`: `res` no longer has the source `src` of `size` bytes (gone, shadowed or
+    /// moved). Only tidies up: a texture named where it is not is checked and passed over.
+    fn unlink(&mut self, res: usize, src: &Source, size: usize) {
+        if texture_index() == 0 {
+            return;
+        }
+        for (s, end) in src.ranges(size) {
+            for p in (s >> SRC_PIECE_SHIFT)..=(end.max(s + 1) - 1) >> SRC_PIECE_SHIFT {
+                if let Some(v) = self.src_pieces.get_mut(&p) {
+                    v.retain(|&r| r != res);
+                    if v.is_empty() {
+                        self.src_pieces.remove(&p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `texture_index`: `res` was made pending.
+    fn note_pending(&mut self, res: usize) {
+        if texture_index() != 0 {
+            self.pending_res.insert(res);
+        }
+    }
+
+    /// `texture_index`: the textures a submit checks – those named by the pieces the written
+    /// pages `dirty` (sorted) lie in, and those made pending since the last call (taken).
+    fn candidates(&mut self, dirty: &[usize]) -> std::collections::BTreeSet<usize> {
+        let mut out = std::mem::take(&mut self.pending_res);
+        let mut last = usize::MAX;
+        for &p in dirty {
+            let piece = p >> SRC_PIECE_SHIFT;
+            if piece != last {
+                last = piece;
+                if let Some(v) = self.src_pieces.get(&piece) {
+                    out.extend(v.iter().copied());
+                }
+            }
+        }
+        out
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -206,6 +304,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.unlink(ores, &old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -241,6 +340,7 @@ impl Table {
         let mut pending_delta = 0isize;
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
+            self.unlink(res, &old.src, old.tex.size() as usize);
             self.by_va.remove(&(old.va, res));
             if old.pending {
                 pending_delta -= 1;
@@ -255,6 +355,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.unlink(ores, &old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -285,6 +386,7 @@ impl Table {
             pending_delta += 1;
         }
         self.by_va.insert((va, res), end);
+        self.link(res, &entry);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -300,6 +402,7 @@ impl Table {
             return (true, 0, Vec::new());
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
+        self.unlink(res, &old.src, old.tex.size() as usize);
         self.by_va.remove(&(old.va, res));
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
@@ -328,6 +431,7 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                self.link(sres, &e);
                 self.by_res.insert(sres, e);
             }
         }
@@ -532,9 +636,16 @@ fn recheck_gpu_view_sources() {
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
+    // lab (`texture_index`): the textures whose source moved, and where it was
+    let mut moved: Vec<(usize, Source)> = Vec::new();
+    let index = texture_index() != 0;
     if all {
-        for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-            changed |= recheck_source(e);
+        for (&res, e) in t.by_res.iter_mut().chain(t.shadowed.iter_mut()) {
+            let old = index.then(|| e.src.clone());
+            if recheck_source(e) {
+                changed = true;
+                moved.extend(old.map(|o| (res, o)));
+            }
         }
     } else {
         let mut on: Vec<usize> = Vec::new();
@@ -545,9 +656,20 @@ fn recheck_gpu_view_sources() {
         on.dedup();
         for res in on {
             if let Some(e) = t.get_mut(res) {
-                changed |= recheck_source(e);
+                let old = index.then(|| e.src.clone());
+                if recheck_source(e) {
+                    changed = true;
+                    moved.extend(old.map(|o| (res, o)));
+                }
             }
         }
+    }
+    // (a shadowed one is linked again when it is uncovered)
+    for (res, old) in moved {
+        let Some(e) = t.by_res.remove(&res) else { continue };
+        t.unlink(res, &old, e.tex.size() as usize);
+        t.link(res, &e);
+        t.by_res.insert(res, e);
     }
     drop(g);
     if changed {
@@ -1007,6 +1129,7 @@ fn revive_named(named: Vec<usize>) {
             if !e.pending && !e.gpu_written {
                 e.pending = true;
                 PENDING.fetch_add(1, Ordering::Relaxed);
+                t.note_pending(res);
             }
         }
     }
@@ -1047,12 +1170,19 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// What the watched ranges are made of, as generations.
+fn watch_key() -> (u64, u64, u64) {
+    (super::sparse::mapped_gen(), TEXTURES_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen())
+}
+
+/// The ranges the last look used, if they are still all there is (`look_ahead`).
+fn last_watch_ranges() -> Option<Arc<Vec<(usize, usize)>>> {
+    let g = WATCH_CACHE.lock().unwrap();
+    g.as_ref().filter(|(k, _)| *k == watch_key()).map(|(_, ranges)| Arc::clone(ranges))
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
-    let key = (
-        super::sparse::mapped_gen(),
-        TEXTURES_GEN.load(Ordering::Acquire),
-        crate::hle::kernelx::graphics_reservations_gen(),
-    );
+    let key = watch_key();
     {
         let g = WATCH_CACHE.lock().unwrap();
         if let Some((k, ref ranges)) = *g {
@@ -1069,8 +1199,15 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     wanted.extend(super::sparse::mapped_ranges());
     // lab: every page of a tiled shadow window is watched (a first write maps its tile)
     wanted.extend(super::sparse::lazy_range());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
-    *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
+    let computed = watch_ranges(&regions, wanted);
+    let mut g = WATCH_CACHE.lock().unwrap();
+    // lab (`look_ahead`): ranges that came out the same stay the same object – the hot blocks
+    // are kept by it, and the thread's rounds go on with them
+    let computed = match g.take() {
+        Some((_, old)) if look_ahead().is_some() && *old == computed => old,
+        _ => Arc::new(computed),
+    };
+    *g = Some((key, Arc::clone(&computed)));
     computed
 }
 
@@ -1177,6 +1314,124 @@ static HOT: Mutex<Option<HotBlocks>> = Mutex::new(None);
 static WALK_RANGES: Mutex<Option<Arc<Vec<(usize, usize)>>>> = Mutex::new(None);
 /// looks, runs they took, bytes they covered, blocks the walk made hot
 static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// a look (or a piece of `look_ahead`'s) is at its write-watch calls: with `look_ahead` the walk
+/// stays out of the way (the kernel does one such call at a time; with the walk going all the
+/// time, a look of 45 calls waited behind it for ~1.3 ms in all – nvidia-dev 7182fb93)
+static LOOKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// lab: `XCL_LOOK_AHEAD=ms` (off unless given; only with `XCL_WATCH_HOT=1`): a thread takes the
+/// written pages of the hot blocks every so many milliseconds while the title submits, and the
+/// next submit takes them with what its own look finds (`AHEAD`). A look's time goes up with the
+/// pages it takes – each is a page-table entry changed and flushed on every core, ~0.5 µs with
+/// the title's threads running – and a retail title's world had ~8,000 a look. What is uploaded,
+/// and when, stays as it was: a round only moves the taking of a page earlier, and a submit's look
+/// waits for a round's piece in progress (`ONE_LOOK`). A round does not count as a look for
+/// `XCL_LOOK_JOIN` (nvidia-dev's a004fe7b lets one stand for a look for `XCL_LOOK_SKIP`; not here).
+fn look_ahead() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("XCL_LOOK_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    (ms > 0 && hot_looks()).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// pages `look_ahead` took for the next submit
+static AHEAD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// one look, or one piece of a round, at a time: what the one before took is in `AHEAD` or in its
+/// submit's hands when the next one asks
+static ONE_LOOK: Mutex<()> = Mutex::new(());
+/// when the title last submitted (the thread rests while it does not)
+static LAST_SUBMIT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// The written pages of `[at, at + len)` taken into `ahead`: how many.
+unsafe fn take_piece(at: usize, len: usize, buf: &mut [*mut c_void], ahead: &Mutex<Vec<usize>>) -> usize {
+    let (mut found, mut page) = (Vec::new(), 0x1000u32);
+    {
+        let _one = ONE_LOOK.lock().unwrap_or_else(|e| e.into_inner());
+        LOOKING.store(true, Ordering::Release);
+        take_written(at, len, buf, &mut found, &mut page);
+        LOOKING.store(false, Ordering::Release);
+        ahead.lock().unwrap().extend_from_slice(&found);
+    }
+    keep_hot(&found, std::time::Instant::now());
+    found.len()
+}
+
+/// The blocks of `pages`, which were found written, are hot from `now` on.
+fn keep_hot(pages: &[usize], now: std::time::Instant) {
+    if pages.is_empty() {
+        return;
+    }
+    if let Some(h) = HOT.lock().unwrap().as_mut() {
+        let mut last = usize::MAX;
+        for &p in pages {
+            let b = p & !(HOT_BLOCK - 1);
+            if b != last {
+                h.hot.insert(b, now);
+                last = b;
+            }
+        }
+    }
+}
+
+/// The blocks of `h` hot at `now` as runs inside `ranges` (those `h` was made for; else none).
+/// Nothing is changed: which blocks go cold, are guarded or are new is the next look's to say
+/// (`take_hot`).
+fn hot_runs_now(h: &HotBlocks, ranges: &Arc<Vec<(usize, usize)>>, now: std::time::Instant) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    if h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+        for (&b, t) in h.hot.iter() {
+            if now.saturating_duration_since(*t) < HOT_FOR {
+                block_runs(ranges, b, &mut runs);
+            }
+        }
+    }
+    runs
+}
+
+/// A round of `look_ahead`: the written pages of all hot blocks, in pieces (a submit's look waits
+/// for one at most). How many it took.
+unsafe fn take_round(buf: &mut [*mut c_void]) -> usize {
+    const PIECE: usize = 64 << 20;
+    let Some(ranges) = last_watch_ranges() else { return 0 };
+    let runs = HOT.lock().unwrap().as_ref().map(|h| hot_runs_now(h, &ranges, std::time::Instant::now())).unwrap_or_default();
+    let mut n = 0;
+    for (base, size) in runs {
+        for at in (base..base + size).step_by(PIECE) {
+            n += take_piece(at, PIECE.min(base + size - at), buf, &AHEAD);
+        }
+    }
+    n
+}
+
+fn start_look_ahead() {
+    let Some(pause) = look_ahead() else { return };
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        crate::xlog_info!("D3D12.X: XCL_LOOK_AHEAD: a thread takes the written pages of the hot blocks every {} ms between the submits", pause.as_millis());
+        let _ = std::thread::Builder::new().name("xcl-look-ahead".into()).spawn(move || {
+            let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 16384];
+            let (mut rounds, mut pages, mut us, mut longest) = (0u64, 0u64, 0u64, 0u64);
+            loop {
+                std::thread::sleep(pause);
+                if LAST_SUBMIT.lock().unwrap().is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200)) {
+                    continue;
+                }
+                let t = std::time::Instant::now();
+                let n = unsafe { take_round(&mut buf) };
+                let took = t.elapsed().as_micros() as u64;
+                (rounds, pages, us, longest) = (rounds + 1, pages + n as u64, us + took, longest.max(took));
+                if rounds % 4096 == 0 {
+                    crate::xlog_info!(
+                        "D3D12.X: {rounds} rounds ahead of the submits so far; the last 4096: {} pages and {:.2} ms each on average, the longest {:.1} ms",
+                        pages / 4096,
+                        us as f64 / 4096e3,
+                        longest as f64 / 1e3
+                    );
+                    (pages, us, longest) = (0, 0, 0);
+                }
+            }
+        });
+    });
+}
 
 /// The written pages of the hot blocks inside `ranges` (see `hot_looks`).
 unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
@@ -1227,9 +1482,11 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
         (runs, h.hot.len(), cold)
     };
     let first = dirty.len();
+    LOOKING.store(true, Ordering::Release);
     for &(base, size) in &runs {
         take_written(base, size, buf, dirty, page);
     }
+    LOOKING.store(false, Ordering::Release);
     // lab (`watch_guard`): a block going cold is guarded, then its pages written before the
     // guard are taken (one written already is given back at once: it is hot again)
     let first_cold = dirty.len();
@@ -1334,6 +1591,10 @@ unsafe fn walk() {
             while at < end {
                 let stop = (at + STEP).min(end);
                 let mut from = at;
+                // lab (`look_ahead`): out of the way of a look's calls
+                while look_ahead().is_some() && LOOKING.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
                 while from < stop {
                     let (mut n, mut page) = (buf.len(), 0u32);
                     if GetWriteWatch(0, from as *const c_void, stop - from, buf.as_mut_ptr(), &mut n, &mut page) != 0 || n == 0 {
@@ -1395,9 +1656,19 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
         super::look_join::look_begins();
     }
     let ranges = cached_watch_ranges(u);
+    let ahead_on = look_ahead().is_some();
+    if ahead_on {
+        *LAST_SUBMIT.lock().unwrap() = Some(std::time::Instant::now());
+    }
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
+        // lab (`look_ahead`): with a look of its own, a round's piece in progress is done first;
+        // what the rounds took is this submit's (a submit without a look takes it too)
+        let _one = (ahead_on && look).then(|| ONE_LOOK.lock().unwrap_or_else(|e| e.into_inner()));
+        if ahead_on {
+            dirty.append(&mut AHEAD.lock().unwrap());
+        }
         WATCH_BUF.with(|wcell| {
             let mut buf = wcell.borrow_mut();
             if buf.len() < 16384 {
@@ -1405,6 +1676,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
             }
             if !look {
             } else if hot_looks() {
+                start_look_ahead();
                 take_hot(&ranges, &mut buf, &mut dirty, &mut page);
             } else {
                 for &(base, size) in ranges.iter() {
@@ -1413,6 +1685,10 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
             }
         });
         dirty.sort_unstable();
+        if ahead_on {
+            // (a page written again after a round took it is found by the look too)
+            dirty.dedup();
+        }
         dirty.len()
     });
     let took = look.then(|| (watch_t0.elapsed(), dirty_len));
@@ -1470,26 +1746,31 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                e.src.written(e.tex.size() as usize, &dirty, page as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src.clone(), Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
+        let wanted = |e: &Entry| e.pending || (!e.gpu_written && e.src.written(e.tex.size() as usize, &dirty, page as usize));
+        let take = |res: usize, e: &mut Entry| {
+            if e.pending {
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+            let p = res as *mut c_void;
+            ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src.clone(), Arc::clone(&e.tex), e.states.clone())))
+        };
+        // lab (`texture_index`): the textures under the written pages and the pending ones only
+        let index = texture_index();
+        let named = (index != 0).then(|| t.candidates(&dirty));
+        if let (1, Some(named)) = (index, &named) {
+            return named.iter().filter_map(|&res| t.by_res.get_mut(&res).filter(|e| wanted(e)).and_then(|e| take(res, e))).collect();
+        }
+        let full: Vec<usize> = t.by_res.iter().filter(|(_, e)| wanted(e)).map(|(&res, _)| res).collect();
+        if let Some(named) = &named {
+            let missed: Vec<String> = full
+                .iter()
+                .filter(|r| !named.contains(r))
+                .filter_map(|r| t.by_res.get(r).map(|e| format!("{r:#x} at {:#x} from {:#x}, pending {}", e.va, e.src.first(), e.pending)))
+                .collect();
+            note_index_check(full.len(), &missed);
+        }
+        full.into_iter().filter_map(|res| t.by_res.get_mut(&res).and_then(|e| take(res, e))).collect()
     });
     // page budget: a texture the CPU wrote again is recent, and one evicted is mapped again
     // before its whole upload (one that cannot be mapped now stays evicted and is not uploaded)
@@ -1514,6 +1795,24 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     upload_all(todo);
     super::submit_cost::textures(t_textures.elapsed());
     took
+}
+
+/// `XCL_TEXTURE_INDEX=2`: a submit's textures to upload by the full check (`wanted` of them),
+/// and those of them the index did not name (as said in the log).
+fn note_index_check(wanted: usize, missed: &[String]) {
+    static N: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let n = N[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let w = N[1].fetch_add(wanted as u64, Ordering::Relaxed) + wanted as u64;
+    let m = N[2].fetch_add(missed.len() as u64, Ordering::Relaxed) + missed.len() as u64;
+    if !missed.is_empty() {
+        static SHOWN: AtomicU64 = AtomicU64::new(0);
+        if SHOWN.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_warn!("D3D12.X: XCL_TEXTURE_INDEX=2: the index missed {} of {wanted} textures to upload: {}", missed.len(), missed[..missed.len().min(4)].join("; "));
+        }
+    }
+    if n.is_power_of_two() && n >= 1024 {
+        crate::xlog_info!("D3D12.X: XCL_TEXTURE_INDEX=2: {n} submits checked, {w} textures to upload, {m} of them missed by the index");
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1750,6 +2049,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
                         e.pending = true;
                         PENDING.fetch_add(1, Ordering::Relaxed);
                         queued += 1;
+                        t.note_pending(res);
                     }
                 }
             }
@@ -2621,6 +2921,61 @@ mod tests {
         }
     }
 
+    /// `XCL_LOOK_AHEAD`: pages a round's piece takes are kept until a submit takes them, a look
+    /// does not find them again, a page written after that is found again, and a piece takes
+    /// only its own range (nvidia-dev a004fe7b's test).
+    #[test]
+    fn pages_found_ahead_are_kept_for_the_next_submit() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 256;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N << 12, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let ahead = Mutex::new(Vec::new());
+            let write = |k: usize| ((base + (k << 12)) as *mut u8).write_volatile(1);
+            for k in (0..N).step_by(2) {
+                write(k);
+            }
+            assert_eq!(take_piece(base, N << 12, &mut buf, &ahead), N / 2, "past a full buffer too");
+            assert_eq!(*ahead.lock().unwrap(), (0..N).step_by(2).map(|k| base + (k << 12)).collect::<Vec<_>>());
+            let (mut dirty, mut page) = (Vec::new(), 0u32);
+            take_written(base, N << 12, &mut buf, &mut dirty, &mut page);
+            assert!(dirty.is_empty(), "a look does not find them again");
+            write(8);
+            write(9);
+            assert_eq!(take_piece(base, N << 12, &mut buf, &ahead), 2);
+            assert_eq!(ahead.lock().unwrap()[N / 2..], [base + 0x8000, base + 0x9000], "written again: found again, behind the others");
+            // (only of its own piece)
+            write(0);
+            write(200);
+            assert_eq!(take_piece(base + (100 << 12), 100 << 12, &mut buf, &ahead), 0);
+            assert_eq!(take_piece(base + (100 << 12), 101 << 12, &mut buf, &ahead), 1);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A round of `XCL_LOOK_AHEAD` takes the blocks hot now, inside the ranges the hot blocks
+    /// were made for, and changes nothing: a block past `HOT_FOR` is the next look's to drop
+    /// (and with `XCL_WATCH_GUARD` to guard), and ranges made since are the next look's.
+    #[test]
+    fn a_round_ahead_takes_the_hot_blocks_and_leaves_them_as_they_are() {
+        let now = std::time::Instant::now();
+        let b = 0x7_0000_0000usize;
+        let ranges = Arc::new(vec![(b, 3 * HOT_BLOCK), (b + 4 * HOT_BLOCK, HOT_BLOCK / 2)]);
+        let mut h = HotBlocks { ranges: Some(Arc::clone(&ranges)), ..Default::default() };
+        h.hot.insert(b, now);
+        h.hot.insert(b + HOT_BLOCK, now);
+        h.hot.insert(b + 2 * HOT_BLOCK, now - HOT_FOR - std::time::Duration::from_millis(1));
+        h.hot.insert(b + 4 * HOT_BLOCK, now);
+        let runs = hot_runs_now(&h, &ranges, now);
+        assert_eq!(runs, vec![(b, 2 * HOT_BLOCK), (b + 4 * HOT_BLOCK, HOT_BLOCK / 2)], "the cold block is left out, the second range is clipped");
+        assert_eq!(h.hot.len(), 4, "nothing dropped");
+        let other = Arc::new((*ranges).clone());
+        assert!(hot_runs_now(&h, &other, now).is_empty(), "ranges the blocks were not made for");
+    }
+
     /// More written pages than one call reports: each is found once, in order, and the look
     /// resets them – a buffer that fills in the middle of the range and one that fills exactly.
     #[test]
@@ -2819,6 +3174,74 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    /// `XCL_TEXTURE_INDEX`: a submit's candidates are the textures under its written pages (by
+    /// 2 MiB piece, a texture over two pieces in both) and those made pending since the last
+    /// one, once; a shadowed texture is not named until it is uncovered, a released one no more,
+    /// and one whose source moved is named where it lies now.
+    #[test]
+    fn the_texture_index_names_the_textures_under_written_pages_and_the_pending() {
+        FORCE_INDEX.with(|f| f.set(1));
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let size = tex.size() as usize;
+        assert_eq!(size, 0x1_0000);
+        let entry = |va: usize, pending: bool| Entry {
+            device: 0,
+            va,
+            src: Source::At(va),
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        let piece = 1usize << SRC_PIECE_SHIFT;
+        let base = 0x40_0000_0000usize;
+        let (a, b, c) = (base, base + 3 * piece - size / 2, base + 8 * piece);
+        let mut t = Table::new();
+        t.insert(1, entry(a, true));
+        t.insert(2, entry(b, false));
+        t.insert(3, entry(c, false));
+        let set = |v: &[usize]| v.iter().copied().collect::<std::collections::BTreeSet<usize>>();
+        assert_eq!(t.candidates(&[]), set(&[1]), "the pending one, once");
+        assert_eq!(t.candidates(&[]), set(&[]));
+        assert_eq!(t.candidates(&[a + 0x5000, base + piece - 0x1000]), set(&[1]));
+        assert_eq!(t.candidates(&[base + 2 * piece + 0x1000]), set(&[2]), "the first piece of one over two");
+        assert_eq!(t.candidates(&[base + 3 * piece]), set(&[2]), "its second");
+        assert_eq!(t.candidates(&[base + 4 * piece, c + size]), set(&[3]), "a page past it is in its piece: checked and passed over");
+        // 4 over 3 at the same place, another range: 3 shadowed, then uncovered pending
+        let mut over = entry(c, false);
+        over.tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        over.placed = true;
+        t.insert(4, over);
+        assert_eq!(t.candidates(&[c]), set(&[4]));
+        t.shadowed.get_mut(&3).unwrap().pending = true;
+        t.remove(4);
+        assert_eq!(t.candidates(&[]), set(&[3]), "uncovered and pending");
+        assert_eq!(t.candidates(&[c]), set(&[3]));
+        // released
+        t.remove(2);
+        assert_eq!(t.candidates(&[b]), set(&[]));
+        // moved (a GPU view's pages): named at its new source only
+        let mut e = t.by_res.remove(&1).unwrap();
+        e.pending = false; // (uploaded by a submit before)
+        let old = std::mem::replace(&mut e.src, Source::Pages(Arc::from(vec![(0, size, base + 20 * piece)])));
+        t.unlink(1, &old, size);
+        t.link(1, &e);
+        t.by_res.insert(1, e);
+        assert_eq!(t.candidates(&[a]), set(&[]));
+        assert_eq!(t.candidates(&[base + 20 * piece + 0x3000]), set(&[1]));
+        // off: nothing is kept
+        FORCE_INDEX.with(|f| f.set(0));
+        if texture_index() == 0 {
+            let mut t = Table::new();
+            t.insert(5, entry(a, true));
+            assert!(t.src_pieces.is_empty() && t.pending_res.is_empty());
+        }
     }
 
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared

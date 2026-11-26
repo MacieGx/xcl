@@ -53,15 +53,80 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
-    let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
-    let mut free = FREE_RES.lock().unwrap();
+    if let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
+        let over = give_back(&mut FREE_RES.lock().unwrap(), FREE_RES_KEPT, bufs);
+        RES_LIVE.fetch_sub(over.iter().map(|b| b.1 as i64).sum(), Ordering::Relaxed);
+    }
+    if let Some(bufs) = ALLOC_SCALED.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
+        let over = give_back(&mut FREE_SCALED.lock().unwrap(), FREE_SCALED_KEPT, bufs);
+        SCALED_STATS[2].fetch_add(over.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// free record buffers kept for reuse (the rest are released)
+const FREE_RES_KEPT: usize = 16;
+/// free scaled-argument buffers kept for reuse (`XCL_SPLIT_FREE_LISTS=1`; small, one a call)
+const FREE_SCALED_KEPT: usize = 64;
+
+/// `bufs` an allocator held, given back to `free` up to `kept` in all; what did not fit (to be
+/// released).
+fn give_back<T>(free: &mut Vec<T>, kept: usize, bufs: Vec<T>) -> Vec<T> {
+    let mut over = Vec::new();
     for b in bufs {
-        if free.len() < 16 {
+        if free.len() < kept {
             free.push(b);
         } else {
-            RES_LIVE.fetch_sub(b.1 as i64, Ordering::Relaxed);
+            over.push(b);
         }
     }
+    over
+}
+
+/// The smallest buffer of `free` (`(buffer, bytes, device)`) of device `dev` with `need` bytes
+/// at least, taken out of it.
+fn take_fitting<T>(free: &mut Vec<(T, u64, usize)>, dev: usize, need: u64) -> Option<(T, u64, usize)> {
+    let i = free.iter().enumerate().filter(|(_, (_, cap, d))| *d == dev && *cap >= need).min_by_key(|(_, (_, cap, _))| *cap).map(|(i, _)| i)?;
+    Some(free.swap_remove(i))
+}
+
+/// lab: `XCL_SPLIT_FREE_LISTS=1` (off unless set): the buffers of the scaled mesh arguments
+/// (`make_scaled_args_buffer`, one a two-pass ExecuteIndirect) go to a free list of their own
+/// and are reused from it. Unset: they are made for each call and given back to the record
+/// buffers' free list (16), which they filled – no record buffer fitted there and none could
+/// be kept, so a new 4 MiB one was made for nearly every recording (a retail title's world:
+/// 16,128 of them in 640 s, "16 free" in every line).
+fn split_free_lists() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPLIT_FREE_LISTS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_SPLIT_FREE_LISTS=1`: scaled-argument buffers held until their allocator's reset, and
+/// those free again
+static ALLOC_SCALED: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
+static FREE_SCALED: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+/// scaled-argument buffers made, reused, released for a full free list
+static SCALED_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A scaled-argument buffer of `bytes` at least (`XCL_SPLIT_FREE_LISTS=1`): a free one, or a new
+/// one of the next power of two (64 KiB at least, as a committed buffer takes anyway).
+unsafe fn scaled_args_buffer(dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64, usize), String> {
+    let dev_key = dev.as_raw() as usize;
+    if let Some(e) = take_fitting(&mut FREE_SCALED.lock().unwrap(), dev_key, bytes) {
+        SCALED_STATS[1].fetch_add(1, Ordering::Relaxed);
+        return Ok(e);
+    }
+    let size = bytes.next_power_of_two().max(64 << 10);
+    let n = SCALED_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: scaled-argument buffer #{n} of {} KiB made (XCL_SPLIT_FREE_LISTS=1: {} reused, {} released, {} free)",
+            size >> 10,
+            SCALED_STATS[1].load(Ordering::Relaxed),
+            SCALED_STATS[2].load(Ordering::Relaxed),
+            FREE_SCALED.lock().unwrap().len()
+        );
+    }
+    Ok((default_uav_buffer(dev, size, "scaled args buffer")?, size, dev_key))
 }
 
 /// lab: bytes of two-pass record buffers that exist (in use, held until their allocator's
@@ -463,7 +528,11 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let (n, made) = (N.fetch_add(1, Ordering::Relaxed) + 1, MADE.fetch_add(need, Ordering::Relaxed) + need);
             if n <= 4 || n.is_power_of_two() || n % 32 == 0 {
-                crate::xlog_info!("D3D12.X: two-pass record buffer #{n} of {} MiB made ({} MiB made so far, {} free)", need >> 20, made >> 20, FREE_RES.lock().unwrap().len());
+                let (free, smaller) = {
+                    let f = FREE_RES.lock().unwrap();
+                    (f.len(), f.iter().filter(|(_, cap, _)| *cap < need).count())
+                };
+                crate::xlog_info!("D3D12.X: two-pass record buffer #{n} of {} MiB made ({} MiB made so far, {free} free, {smaller} of them smaller)", need >> 20, made >> 20);
             }
             RES_LIVE.fetch_add(need as i64, Ordering::Relaxed);
             (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key)
@@ -712,7 +781,13 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     let src_ptr = src_raw as *mut c_void;
     let src = ID3D12Resource::from_raw_borrowed(&src_ptr).ok_or("indirect args buffer")?;
     let bytes = (max as u64).saturating_mul(stride as u64).max(256).next_multiple_of(256);
-    let dst = default_uav_buffer(&dev, bytes, "scaled args buffer")?;
+    let split = split_free_lists();
+    let (dst, bytes) = if split {
+        let (b, cap, _) = scaled_args_buffer(&dev, bytes)?;
+        (b, cap)
+    } else {
+        (default_uav_buffer(&dev, bytes, "scaled args buffer")?, bytes)
+    };
     emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
@@ -724,7 +799,15 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     emit_transition(list, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     let dev_key = dev.as_raw() as usize;
-    with(this, |s| s.res_retired.push((dst.clone(), bytes, dev_key)));
+    if split {
+        // (held for the allocator this recording is on, as the record buffers are at its reset)
+        let allocator = with(this, |s| s.allocator);
+        if allocator != 0 {
+            ALLOC_SCALED.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push((dst.clone(), bytes, dev_key));
+        }
+    } else {
+        with(this, |s| s.res_retired.push((dst.clone(), bytes, dev_key)));
+    }
     Ok(dst)
 }
 
@@ -3246,6 +3329,36 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// One free list for both (as before `XCL_SPLIT_FREE_LISTS`): sixteen small scaled-argument
+    /// buffers given back first fill it, the 4 MiB record buffer after them is released, and a
+    /// recording that needs 4 MiB finds none. Two lists: the record buffer is kept and taken
+    /// again, and a scaled-argument buffer is the smallest that fits, of the same device.
+    #[test]
+    fn scaled_argument_buffers_keep_out_of_the_record_buffers_free_list() {
+        const MIB: u64 = 1 << 20;
+        let (dev, other) = (0x1000usize, 0x2000usize);
+        let scaled = |k: u32| (k, 64 << 10, dev);
+        let record = (100u32, 4 * MIB, dev);
+        // shared
+        let mut shared = Vec::new();
+        assert!(give_back(&mut shared, FREE_RES_KEPT, (0..16).map(scaled).collect()).is_empty());
+        assert_eq!(give_back(&mut shared, FREE_RES_KEPT, vec![record]), vec![record], "the record buffer is released");
+        assert_eq!(take_fitting(&mut shared, dev, 4 * MIB), None, "a new 4 MiB buffer is made");
+        // split
+        let (mut records, mut scaleds) = (Vec::new(), Vec::new());
+        assert!(give_back(&mut scaleds, FREE_SCALED_KEPT, (0..16).map(scaled).collect()).is_empty());
+        assert!(give_back(&mut records, FREE_RES_KEPT, vec![record]).is_empty());
+        assert_eq!(take_fitting(&mut records, dev, 4 * MIB), Some(record));
+        // the smallest that fits, of its device; over the limit is released
+        assert!(give_back(&mut scaleds, FREE_SCALED_KEPT, vec![(50, 256 << 10, dev), (51, 128 << 10, other), (52, 128 << 10, dev)]).is_empty());
+        assert_eq!(take_fitting(&mut scaleds, dev, 100 << 10), Some((52, 128 << 10, dev)));
+        assert_eq!(take_fitting(&mut scaleds, dev, 200 << 10), Some((50, 256 << 10, dev)));
+        assert_eq!(take_fitting(&mut scaleds, dev, 200 << 10), None);
+        assert_eq!(scaleds.len(), 17);
+        let over = give_back(&mut scaleds, FREE_SCALED_KEPT, (200..260).map(scaled).collect());
+        assert_eq!((scaleds.len(), over.len()), (FREE_SCALED_KEPT, 17 + 60 - FREE_SCALED_KEPT));
+    }
 
     /// The descriptor tables a draw binds are where its table arguments point (in unified
     /// memory), constants and root buffers are not tables, and an unset table is none.
