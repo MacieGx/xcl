@@ -1769,7 +1769,13 @@ fn prepare_workers() -> usize {
     }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (used, limit) = crate::host::system_commit();
-    workers_for(cores, limit.saturating_sub(used))
+    workers_for(cores, free_commit_mb(used, limit))
+}
+
+/// The commit left in MB of `system_commit`'s commit and limit, which are in bytes (passed as
+/// they were, `workers_for`'s 3 GB a worker never held a worker back).
+fn free_commit_mb(used: u64, limit: u64) -> u64 {
+    limit.saturating_sub(used) >> 20
 }
 
 /// The workers for `cores` logical processors (threads, not cores) and `free_mb` of commit left.
@@ -2497,6 +2503,16 @@ mod tests {
         assert_eq!(workers_for(2, 100_000), 1);
         assert_eq!(workers_for(64, 1_000_000), 32);
         assert_eq!(workers_for(32, 0), 1);
+    }
+
+    /// The commit left reaches `workers_for` in MB: 10 GB left of a 64 GB limit is room for 3
+    /// workers, not for every processor.
+    #[test]
+    fn preparation_workers_count_the_commit_left_in_megabytes() {
+        let gb = 1u64 << 30;
+        assert_eq!(free_commit_mb(54 * gb, 64 * gb), 10 * 1024);
+        assert_eq!(workers_for(32, free_commit_mb(54 * gb, 64 * gb)), 3);
+        assert_eq!(free_commit_mb(64 * gb, 32 * gb), 0);
     }
 
     /// A builder's progress line gives its record count; its other lines give none.
