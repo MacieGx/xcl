@@ -105,6 +105,12 @@ fn count(k: usize) {
     }
 }
 
+/// lab: arena blocks the lists hold themselves (a recording's blocks go to its allocator at the
+/// list's next reset); 0 when the map is in use.
+pub(super) fn blocks_in_lists() -> usize {
+    STATES.try_lock().ok().and_then(|g| g.as_ref().map(|m| m.values().map(|s| s.uma.len()).sum())).unwrap_or(0)
+}
+
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
@@ -451,7 +457,7 @@ unsafe fn bind_two_pass_stage(
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take_or(u, bytes.len().max(16), 256, &mut s.uma, super::sparse::arena_block)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
@@ -2408,7 +2414,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     super::view_mem::ensure_for_draw(layout.as_deref(), &args);
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take_or(u, bytes.len().max(16), 256, &mut s.uma, super::sparse::arena_block)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };

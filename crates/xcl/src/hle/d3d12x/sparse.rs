@@ -1654,6 +1654,30 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
     Some((addr, rounded))
 }
 
+/// lab: a block for a list's arena when the coherent window is full (a retail title takes
+/// 3934 of its 4095 MB at start; XCL's 64 MB pool + 97 MB were used up ~160 s into the world
+/// and from then on a sixth of the draws and a third of the dispatches were skipped as
+/// "unified memory is full"). `XCL_ARENA_SPARSE=0`: none, as before.
+pub fn arena_block(bytes: usize) -> Option<usize> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_ARENA_SPARSE").map_or(true, |v| v != "0")) {
+        return None;
+    }
+    static BLOCKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let p = unsafe { alloc(bytes, crate::gpu::uma::GRAIN) }.map(|(p, _)| p);
+    let n = BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        let (allocators, pending) = super::console_list::pending_blocks();
+        crate::xlog_info!(
+            "lab: arena block #{n} ({} KB) from the sparse windows: the coherent window is full ({pending} blocks held for {allocators} allocators, {} in lists that record or wait for their reset){}",
+            bytes >> 10,
+            super::bind::blocks_in_lists() + super::console_list::blocks_in_lists(),
+            if p.is_none() { " - none there either" } else { "" }
+        );
+    }
+    p
+}
+
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {

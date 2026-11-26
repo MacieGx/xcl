@@ -696,6 +696,13 @@ impl Arena {
     /// `n` bytes at an `align`-aligned address in committed unified memory (not zeroed), or
     /// None when committed unified memory is full.
     pub fn take(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>) -> Option<*mut u8> {
+        self.take_or(u, n, align, blocks, |_| None)
+    }
+
+    /// `take`; when committed unified memory is full, the block comes from `other` (bytes ->
+    /// address of a block of at least that size, aligned to a grain; freed by the blocks' owner
+    /// like the others).
+    pub fn take_or(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>, other: impl FnOnce(usize) -> Option<usize>) -> Option<*mut u8> {
         let align = align.max(16).next_power_of_two();
         let n = n.max(1);
         let at = (self.at + align - 1) & !(align - 1);
@@ -705,14 +712,20 @@ impl Arena {
         }
         if n > ARENA_BLOCK / 2 {
             // a large piece: a block of its own (the current one stays in use)
-            let p = u.alloc(n, align)?;
+            let p = match u.alloc(n, align) {
+                Some(p) => p,
+                None => other(n.next_multiple_of(align.max(GRAIN)))? as *mut u8,
+            };
             blocks.push(p as usize);
             return Some(p);
         }
         // XCL's pool first, then any free part of committed unified memory
         let p = match u.pool_block() {
             Some(p) => p,
-            None => u.alloc(ARENA_BLOCK, GRAIN)? as usize,
+            None => match u.alloc(ARENA_BLOCK, GRAIN) {
+                Some(p) => p as usize,
+                None => other(ARENA_BLOCK)?,
+            },
         };
         blocks.push(p);
         self.at = p + n;

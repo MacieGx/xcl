@@ -360,6 +360,11 @@ pub fn allocator_reset(allocator: *mut c_void) {
     super::indirect_clamp::allocator_reset(allocator as usize);
 }
 
+/// lab: arena blocks the console lists hold themselves; 0 when the map is in use.
+pub(super) fn blocks_in_lists() -> usize {
+    LISTS.try_lock().ok().and_then(|g| g.as_ref().map(|m| m.values().map(|st| st.uma.len()).sum())).unwrap_or(0)
+}
+
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
     LISTS.lock().unwrap().as_mut()?.get_mut(&obj).map(f)
 }
@@ -670,7 +675,7 @@ unsafe fn free_uma(blocks: &[usize]) {
 unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
     // 32-bit console addresses: window 0; a piece of the list's arena
-    let p = st.arena.take(u, bytes.len().max(16), 256, &mut st.uma)?;
+    let p = st.arena.take_or(u, bytes.len().max(16), 256, &mut st.uma, super::sparse::arena_block)?;
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
     Some(p as usize)
 }
