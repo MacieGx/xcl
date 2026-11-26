@@ -1529,6 +1529,11 @@ pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[
     };
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
     note_outside_buffer(va, bytes, p);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 4 || k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: buffer #{k} placed outside the memory windows at {va:#x} ({bytes} bytes) lives at {p:#x} in the sparse windows");
+    }
     Some(hr)
 }
 

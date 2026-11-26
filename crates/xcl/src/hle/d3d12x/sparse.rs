@@ -1681,6 +1681,7 @@ pub unsafe fn place_buffer_when(this: *mut c_void, va: usize, desc: &D3D12_RESOU
     }
     let raw = *ppv;
     if lazy {
+        LAZY_BYTES[0].fetch_add((delta + bytes) as u64, Ordering::Relaxed);
         s.lazy.push((raw as usize, start, delta + bytes));
         publish_lazy_bounds(s);
         return Some((hr, delta));
@@ -1690,6 +1691,9 @@ pub unsafe fn place_buffer_when(this: *mut c_void, va: usize, desc: &D3D12_RESOU
     s.signal();
     Some((hr, delta))
 }
+
+/// bytes of the buffers placed lazily: placed, given their video memory since
+static LAZY_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// (lowest, highest) address of the buffers waiting for their tiles (`State::lazy`; 0, 0: none):
 /// what `use_range` checks before it takes the state's lock
@@ -1727,6 +1731,13 @@ pub unsafe fn use_range(va: usize, len: usize) {
         let ptr = raw as *mut c_void;
         if let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr).cloned() {
             s.back_buffer(&res, start, bytes);
+            let used = LAZY_BYTES[1].fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+            static N: AtomicU64 = AtomicU64::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if k <= 4 || k.is_power_of_two() {
+                let placed = LAZY_BYTES[0].load(Ordering::Relaxed);
+                crate::xlog_info!("sparse windows: lazily placed buffer #{k} at {start:#x} ({bytes} bytes) gets its video memory at its first use; {} of {} MB placed so far", used >> 20, placed >> 20);
+            }
         }
     }
     publish_lazy_bounds(s);
