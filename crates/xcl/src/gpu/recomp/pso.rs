@@ -1415,10 +1415,11 @@ pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> Vec<([u32; 3], [u32; 
 }
 
 /// A chain's dispatch of `grid` groups, `most` of them at once (`dispatch_slabs`). `used`: the
-/// list (or one before it) has used `scratch`.
+/// list (or one before it) has used `scratch`. `piece_done(i)` after the dispatch of piece `i`
+/// is recorded (lab: `XCL_GPU_PROFILE` marks the list there).
 pub(crate) unsafe fn record_dispatch_chain<'a>(
     list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
-    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone, mut piece_done: impl FnMut(usize),
 ) {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
@@ -1432,6 +1433,7 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
         list.SetPipelineState(piece);
         list.Dispatch(x, y, z);
+        piece_done(i);
     }
     }
 }

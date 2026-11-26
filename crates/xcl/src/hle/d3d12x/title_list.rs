@@ -133,6 +133,7 @@ unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
 unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
+    super::gpu_profile::list_close(pc);
     let hr = f(pc);
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {

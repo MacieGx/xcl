@@ -2342,7 +2342,12 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 // ---------------------------------------------------------------------------------------
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_memory_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_memory_x_unmarked(this, dst, src, size, _flags))
+}
+
+unsafe extern "system" fn copy_memory_x_unmarked(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     title_writes(this);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
@@ -2976,6 +2981,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         let ext = *(seg as *const usize);
         super::indirect_clamp::list_closing(seg);
+        super::gpu_profile::list_close(seg);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
         last = Some(seg);
@@ -3052,6 +3058,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
 
     let ext = *(list as *const usize);
     super::indirect_clamp::list_closing(list);
+    super::gpu_profile::list_close(list);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
     if close_hr < 0 {
@@ -3343,7 +3350,12 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
+/// lab (`XCL_GPU_PROFILE`): marked as a title barrier (`uav_barrier_x_unmarked`)
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    gp_marked(this, super::gpu_profile::Kind::Barrier, || uav_barrier_x_unmarked(this, _n, _barriers))
+}
+
+unsafe extern "system" fn uav_barrier_x_unmarked(this: *mut c_void, _n: u32, _barriers: *const c_void) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3375,7 +3387,12 @@ pub(super) unsafe extern "system" fn unknown_101_x(this: *mut c_void, a1: usize,
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_resource_flags_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_resource_flags_x_unmarked(this, dst, src, _flags))
+}
+
+unsafe extern "system" fn copy_resource_flags_x_unmarked(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
     title_writes(this);
     if dst != src {
         copy_resource_x(this, dst, src);
@@ -3423,6 +3440,22 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     };
     drop(extra);
     Some(raw)
+}
+
+/// lab (`XCL_GPU_PROFILE`): a title copy or barrier between two marks (the outermost one only:
+/// the hooks call each other)
+unsafe fn gp_marked(this: *mut c_void, kind: super::gpu_profile::Kind, f: impl FnOnce()) {
+    thread_local! {
+        static IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !super::gpu_profile::on() || IN.with(|c| c.get()) {
+        return f();
+    }
+    IN.with(|c| c.set(true));
+    super::gpu_profile::mark(this, super::gpu_profile::Label::of(super::gpu_profile::Kind::Other));
+    f();
+    super::gpu_profile::mark(this, super::gpu_profile::Label::of(kind));
+    IN.with(|c| c.set(false));
 }
 
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
@@ -3625,6 +3658,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext = *(this as *const usize);
     super::indirect_clamp::list_closing(this);
+    super::gpu_profile::list_close(this);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
@@ -3636,6 +3670,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let q_raw = queue as *mut c_void;
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    super::gpu_profile::note_queue(q_raw);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
     // If this list was previously split mid-recording around a `Wait64`, flush all earlier closed
@@ -4464,7 +4499,12 @@ const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100
 /// #26 ResourceBarrier(count, barriers): console barriers (D3D12_RESOURCE_BARRIER, 32 bytes) as
 /// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
 /// transition left with nothing to do goes, aliasing barriers name placed textures
+/// lab (`XCL_GPU_PROFILE`): marked as a title barrier (`resource_barrier_x_unmarked`)
 pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
+    gp_marked(this, super::gpu_profile::Kind::Barrier, || resource_barrier_x_unmarked(this, n, barriers))
+}
+
+unsafe extern "system" fn resource_barrier_x_unmarked(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
     super::clamp_runs::barrier(this as usize);
     // (a barrier that is no transition: the console's mark that writes before it are read after it)
     if !barriers.is_null() && (0..n as usize).any(|k| barriers.add(k).read_unaligned()[0] != 0) {
@@ -4800,7 +4840,12 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
     }
 }
 
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_buffer_region_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_buffer_region_x_unmarked(this, dst, dst_off, src, src_off, n))
+}
+
+unsafe extern "system" fn copy_buffer_region_x_unmarked(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     title_writes(this);
     real::use_buffer(dst);
     real::use_buffer(src);
@@ -4838,7 +4883,12 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 }
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_texture_region_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_texture_region_x_unmarked(this, dst, x, y, z, src, bx))
+}
+
+unsafe extern "system" fn copy_texture_region_x_unmarked(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -4922,7 +4972,12 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
 
 /// command list #83 CopyTextureRegionX(dst, x, y, z, src, box, flags): CopyTextureRegion with
 /// console copy flags (the title's texture streaming calls it where the DMA list gets #12)
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_texture_region_flags_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, _flags: u32) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_texture_region_flags_x_unmarked(this, dst, x, y, z, src, bx, _flags))
+}
+
+unsafe extern "system" fn copy_texture_region_flags_x_unmarked(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, _flags: u32) {
     copy_texture_region_x(this, dst, x, y, z, src, bx)
 }
 
@@ -5042,7 +5097,12 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
+/// lab (`XCL_GPU_PROFILE`): marked as a title copy (`copy_resource_x_unmarked`)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    gp_marked(this, super::gpu_profile::Kind::Copy, || copy_resource_x_unmarked(this, dst, src))
+}
+
+unsafe extern "system" fn copy_resource_x_unmarked(this: *mut c_void, dst: usize, src: usize) {
     title_writes(this);
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);

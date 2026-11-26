@@ -120,6 +120,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     super::indirect_clamp::list_reset(list as usize);
+    super::gpu_profile::list_reset(list);
     let (old, blocks, res_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -635,9 +636,11 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va) = ensure_res_buffer(this, need)?;
             ms_probe(this, "DM", &tp, groups);
+            gp_mark(this, gp::Label::of(gp::Kind::Other));
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(groups, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            gp_mark(this, gp::Label::op(gp::Kind::TwoPassCs, gp_two_pass(&tp), [groups, 0, 0]));
             {
                 // lab: as above, for a direct two-pass DispatchMesh (kinds 8..11)
                 let (r, vd) = (res_buf.as_raw() as usize, tp.record.vert_dwords() as u64 * 4);
@@ -649,6 +652,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             pc_dm(this, groups.saturating_mul(tp.mesh_groups_per_record), 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            gp_mark(this, gp::Label::op(gp::Kind::TwoPassMs, gp_two_pass(&tp), [groups, 0, 0]));
             Ok(())
         })();
         match run {
@@ -683,7 +687,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     }
     super::targets::note_draw(this, super::targets::PC);
     count(DRAWS_PC);
+    gp_mark(this, gp::Label::of(gp::Kind::Other));
     pc_dm(this, x, y, z);
+    gp_mark(this, gp::Label::op(gp::Kind::PcDraw, (0, 0), [x, y, z]));
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
@@ -726,6 +732,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // lab: `XCL_TWO_PASS_UNBOUNDED=1`: the passes read the title's records as they are
             static UNBOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let unbounded = *UNBOUNDED.get_or_init(|| std::env::var_os("XCL_TWO_PASS_UNBOUNDED").is_some());
+            gp_mark(this, gp::Label::of(gp::Kind::Other));
             let bounded = if unbounded { None } else { super::indirect_clamp::bound_in_run(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget) };
             if bounded.is_none() && !unbounded {
                 // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
@@ -737,6 +744,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 return;
             }
+            let gp_name = gp_two_pass(&tp);
+            gp_mark(this, gp::Label::op(gp::Kind::Clamp, gp_name, [max, 1, 0]));
             let (args, args_off) = match &bounded {
                 Some(b) => (b.raw(), b.offset()),
                 None => (args, args_off),
@@ -791,6 +800,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 // (`fresh_indirect_arguments`; NVIDIA runs the old records otherwise)
                 ordered(&|| pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off));
                 emit_uav_barrier(list, Some(&res_buf));
+                gp_mark(this, gp::Label::op(gp::Kind::TwoPassCs, gp_name, [max, 0, 0]));
                 {
                     // lab: record 0 as the compute pass left it (kind 4: vertices, primitives, spare; 5/6/7: position of vertex 0/1/2, w as the "count")
                     let (r, vd) = (res_buf.as_raw() as usize, tp.record.vert_dwords() as u64 * 4);
@@ -801,6 +811,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
                     let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
+                    gp_mark(this, gp::Label::op(gp::Kind::TwoPassScale, gp_name, [max, 0, 0]));
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
                     fresh_indirect_arguments(this, || pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off));
                 } else {
@@ -808,10 +819,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     ordered(&|| pc(this, sig, max, args, args_off, count_buf, count_off));
                 }
                 emit_uav_barrier(list, Some(&res_buf));
+                gp_mark(this, gp::Label::op(gp::Kind::TwoPassMs, gp_name, [max, 0, 0]));
                 Ok(())
             })();
             if let Some(b) = bounded {
                 b.finish(list);
+                gp_mark(this, gp::Label::op(gp::Kind::ClampFinish, gp_name, [max, 1, 0]));
             }
             match run {
                 Ok(()) => {
@@ -887,7 +900,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             list.SetGraphicsRootSignature(r);
         }
         ei_work(this, sig, super::targets::PC);
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        gp_mark(this, gp::Label::of(gp::Kind::Other));
+        fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        gp_mark(this, gp::Label::op(gp::Kind::PcIndirect, (0, 0), [max, 0, 0]));
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         ei_work(this, sig, super::targets::SKIPPED);
@@ -902,7 +918,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // list's compute bindings, which `bind_abi` sets again
     // lab (`XCL_FOLD_GROUPS`): a program with a folded group id gets its wide records as rows
     let fold = if !gfx && super::real::pso_shaders(pso).is_some_and(|s| crate::gpu::dxil::kernel::fold_groups(s.0)) { crate::gpu::dxil::kernel::FOLD_ROW } else { 0 };
+    let gp_name = if gp::on() { super::real::pso_shaders(super::pso_async::resolve(pso)).unwrap_or((0, 0)) } else { (0, 0) };
+    let gp_kind = if gfx { gp::Kind::IndirectDraw } else { gp::Kind::IndirectDispatch };
+    gp_mark(this, gp::Label::of(gp::Kind::Other));
     let bounded = super::indirect_clamp::with_fold(fold, || super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off));
+    if bounded.is_some() {
+        gp_mark(this, gp::Label::op(gp::Kind::Clamp, gp_name, [max, 0, 0]));
+    }
     match &bounded {
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), b.offset(), count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
@@ -973,10 +995,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
         count(if gfx { DRAWS } else { DISPATCHES });
+        gp_mark(this, gp::Label::of(gp::Kind::Other));
         fresh_indirect_arguments(this, || match &bounded {
             Some(b) => pc(this, sig, max, b.raw(), b.offset(), count_buf, count_off),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
         });
+        gp_mark(this, gp::Label::op(gp_kind, gp_name, [max, 0, 0]));
         for (res, plane) in twins {
             super::list_x::depth_twin_flush(this, res, plane);
         }
@@ -988,6 +1012,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     if let Some(b) = bounded {
         b.finish(list);
+        gp_mark(this, gp::Label::op(gp::Kind::ClampFinish, gp_name, [max, 0, 0]));
     }
     if let Err(e) = result {
         ei_work(this, sig, super::targets::SKIPPED);
@@ -1588,12 +1613,54 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        gp_mark(this, gp::Label::of(gp::Kind::Other));
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            gp_draw(this, [vertices, instances, 0]);
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        gp_draw(this, [vertices, instances, 0]);
     }
+}
+
+use super::gpu_profile as gp;
+
+/// lab (`XCL_GPU_PROFILE`): a mark on `this` (nothing when the profile is off)
+unsafe fn gp_mark(this: *mut c_void, label: gp::Label) {
+    if gp::on() {
+        gp::mark(this, label);
+    }
+}
+
+/// lab (`XCL_GPU_PROFILE`): the mark after a draw on `this` with its bound pipeline
+unsafe fn gp_draw(this: *mut c_void, size: [u32; 3]) {
+    if !gp::on() {
+        return;
+    }
+    let pso = super::pso_async::resolve(with(this, |s| s.pso));
+    let label = if super::real::is_translated_graphics(pso) {
+        gp::Label::op(gp::Kind::Draw, super::real::pso_shaders(pso).unwrap_or((0, 0)), size)
+    } else {
+        gp::Label::op(gp::Kind::PcDraw, (0, 0), size)
+    };
+    gp::mark(this, label);
+}
+
+/// lab (`XCL_GPU_PROFILE`): the console shaders of a compute pipeline
+fn gp_cs(pso: usize) -> (u64, u64) {
+    if !gp::on() {
+        return (0, 0);
+    }
+    super::real::pso_shaders(super::pso_async::resolve(pso)).map_or((0, 0), |s| (s.0, 0))
+}
+
+/// lab (`XCL_GPU_PROFILE`): what a two-pass pipeline is named by (MS, PS)
+fn gp_two_pass(tp: &super::real::TwoPassPso) -> (u64, u64) {
+    if !gp::on() {
+        return (0, 0);
+    }
+    (tp.ms_hash, super::real::two_pass_ps_hash(tp.compute))
 }
 
 thread_local! {
@@ -1605,7 +1672,9 @@ thread_local! {
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
+        gp_mark(this, gp::Label::of(gp::Kind::Other));
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+        gp_draw(this, [indices, instances, 0]);
     }
 }
 
@@ -2482,7 +2551,16 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     pass_fill_at(this, pso, true);
     let timed = gpu_time_begin(this, pso);
     bind_abi(this, list, pso, false)?;
-    let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    gp_mark(this, gp::Label::of(gp::Kind::Other));
+    let cs = gp_cs(pso);
+    let mut pieces = 0u32;
+    let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z], |i| {
+        pieces += 1;
+        gp_mark(this, gp::Label::op(gp::Kind::ChainPiece, (cs.0, i as u64), [x, y, z]));
+    });
+    if pieces == 0 {
+        gp_mark(this, gp::Label::op(gp::Kind::Dispatch, cs, [x, y, z]));
+    }
     gpu_time_end(this, timed);
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);

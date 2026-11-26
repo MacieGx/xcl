@@ -1185,12 +1185,14 @@ impl State {
         let slot = &self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
+        crate::hle::d3d12x::gpu_profile::own_list_begin(slot.list.as_raw());
         idx
     }
 
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
+        crate::hle::d3d12x::gpu_profile::own_list_end(self.slots[idx].list.as_raw(), crate::hle::d3d12x::gpu_profile::Kind::Upload);
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
@@ -1381,6 +1383,7 @@ impl State {
             if parts.is_empty() {
                 let _ = self.rb_alloc.Reset();
                 let _ = self.rb_list.Reset(&self.rb_alloc, None);
+                crate::hle::d3d12x::gpu_profile::own_list_begin(self.rb_list.as_raw());
             }
             self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
             parts.push((cur, used, chunk));
@@ -1388,6 +1391,7 @@ impl State {
             cur += chunk;
         }
         if !parts.is_empty() {
+            crate::hle::d3d12x::gpu_profile::own_list_end(self.rb_list.as_raw(), crate::hle::d3d12x::gpu_profile::Kind::Readback);
             if self.rb_list.Close().is_ok() {
                 if let Ok(l) = self.rb_list.cast::<ID3D12CommandList>() {
                     super::title_textures::own_work(|| {
@@ -1525,6 +1529,7 @@ impl State {
             };
             let _ = job.alloc.Reset();
             let _ = job.list.Reset(&job.alloc, None);
+            crate::hle::d3d12x::gpu_profile::own_list_begin(job.list.as_raw());
             let mut off = 0usize;
             for (wi, cur, chunk) in batch {
                 let (base, res) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -1532,6 +1537,7 @@ impl State {
                 job.copies.push((cur, off, chunk));
                 off += chunk;
             }
+            crate::hle::d3d12x::gpu_profile::own_list_end(job.list.as_raw(), crate::hle::d3d12x::gpu_profile::Kind::Readback);
             if job.list.Close().is_ok() {
                 if let Ok(l) = job.list.cast::<ID3D12CommandList>() {
                     super::title_textures::own_work(|| q.ExecuteCommandLists(&[Some(l)]));
