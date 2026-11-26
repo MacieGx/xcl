@@ -51,6 +51,8 @@
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
+pub mod cfg;
+pub mod code_loads;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
@@ -59,6 +61,7 @@ pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -68,10 +71,16 @@ pub mod ssa;
 mod tests;
 #[cfg(test)]
 mod heap_window_tests;
+#[cfg(test)]
+mod link_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
-/// window k is raw UAV `MEM_HEAP_BASE + k`.
-pub const MEM_HEAP_BASE: u32 = 0;
+/// window k is raw UAV `MEM_HEAP_BASE + k`. Not 0: a T# whose word 0 is 0 (an empty console
+/// slot, all zeros) makes image shaders take `ResourceDescriptorHeap[0]` (SRV) and `[1]` (UAV);
+/// with the windows there that is a 4 GiB raw buffer UAV read as a texture, which hangs NVIDIA
+/// GPUs (DXGI_ERROR_DEVICE_HUNG). Descriptors below hold null views
+/// (`console_heap::null_views`).
+pub const MEM_HEAP_BASE: u32 = 4;
 
 /// Windows a shader with `Options::heap_windows` reaches (descriptors `MEM_HEAP_BASE`..): the
 /// unified block's (`uma::MAX_WINDOWS`) and, after them, the title's memory outside it
@@ -81,6 +90,11 @@ pub const HEAP_WINDOW_SLOTS: u32 = 16;
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
+    windows <= crate::gpu::uma::MAX_WINDOWS
+        || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
+}
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -199,9 +213,11 @@ pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
 /// High dword `s_getpc_b64` gives a program that has constant data in its code region
-/// (`Options::rodata`) and several memory windows: its code addresses are then above every
+/// (`Options::rodata`) and a load that may or may not read it (`code_loads::CodeLoad::Maybe`),
+/// with any number of memory windows: its code addresses are then above every
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
-/// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
+/// any memory with one window, which ignores the high dword).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 
 impl GsInterface {
@@ -1053,18 +1069,84 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
+/// The whole-wave reductions of a wave32 program (`wave32_reductions`).
+#[derive(Default)]
+pub struct Reductions {
+    /// pc of a `v_cndmask` that starts one → the VGPR it writes
+    pub seeds: std::collections::BTreeMap<u64, u64>,
+    /// pc of the `v_readlane` that ends one → (its seed's pc, the operation: `xcl_red_<op>`)
+    pub reads: std::collections::BTreeMap<u64, (u64, &'static str)>,
+}
+
+/// The reductions the console's compiler makes over the lanes of a wave32 wave:
+/// `s_or_saveexec_b32 s, -1` (every lane runs, launched or not), `v_cndmask v, identity, value,
+/// mask`, three DPP8 steps (within 2, 4 and 8 lanes), a DPP row mirror, `v_permlanex16 w, v`, one more
+/// step and `v_readlane s, v, 0` – nothing else in between, all in one basic block.
+fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> Reductions {
+    let op_of = |d: &Decoded| match d.inst.name {
+        "V_OR_B32" => Some(("or", 128)),
+        "V_MAX_U32" => Some(("max", 128)),
+        "V_AND_B32" => Some(("and", 193)),
+        "V_MIN_U32" => Some(("min", 193)),
+        _ => None,
+    };
+    let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
+    let ext = |d: &Decoded, n: &str| emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, n));
+    // (the steps' waits and nops are not part of it)
+    let idle = |d: &Decoded| matches!(d.inst.name, "S_NOP" | "S_WAITCNT" | "V_NOP" | "S_WAITCNT_DEPCTR" | "S_INST_PREFETCH");
+    // step k takes its value from the other half of the 2^(k+1) lanes a lane is in (all lanes of a
+    // half hold the same by then, so any of them will do)
+    let other_half = |k: usize, n: u64, sel: Option<u64>| sel.is_some_and(|s| s >> (k + 1) == n >> (k + 1) && (s ^ n) >> k & 1 == 1);
+    let mut out = Reductions::default();
+    for (i, seed) in insts.iter().enumerate() {
+        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain {
+            continue;
+        }
+        // the every-lane section it is in, with no other EXEC write before the end
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let open = i - 1 - open;
+        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
+        let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
+        let Some((op, identity)) = op_of(a) else { continue };
+        let (_, w) = rdna2::vgpr_uses(seed);
+        let [v] = w[..] else { continue };
+        if f(seed, "SRC0") != Some(identity) {
+            continue;
+        }
+        let same = |d: &Decoded, variant: rdna2::Variant| {
+            let (r, w) = rdna2::vgpr_uses(d);
+            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+        };
+        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let crossed = {
+            let (r, w) = rdna2::vgpr_uses(cross);
+            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
+        };
+        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+            continue;
+        }
+        let (r, _) = rdna2::vgpr_uses(read);
+        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+            continue;
+        }
+        // one basic block, and EXEC kept all ones from the section's start
+        let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
+        let inside = &insts[open + 1..=end];
+        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
+        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
+        if !straight || exec {
+            continue;
+        }
+        out.seeds.insert(seed.pc, v);
+        out.reads.insert(read.pc, (seed.pc, op));
+    }
+    out
+}
+
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
-    let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-    for (k, d) in block.iter().enumerate() {
-        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
-        if !matches!(flow, emit::Flow::Next) {
-            break;
-        }
-    }
+    let flow = em.emit_insts(insts_in(c, start, end), end);
     body.push_str(&em.take());
     *blocks += 1;
     flow
@@ -1269,15 +1351,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
-        let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-        for (k, d) in block.iter().enumerate() {
-            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
-            if !matches!(flow, emit::Flow::Next) {
-                break;
-            }
-        }
+        let flow = em.emit_insts(insts_in(c, start, end), end);
         body.push_str(&em.take());
         let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
         let tail = match flow {
@@ -1415,6 +1489,14 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: 
     translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
+/// Wave size of an FSSM's program: wave32 when its header says so (`Fssm::wave32`), else by
+/// the code. A wave32 program that never writes EXEC has nothing in its code to tell, and
+/// `detect_wave64` takes it for wave64: its cross-lane reads (`v_readfirstlane`, `v_readlane`,
+/// permutes) then span 64 threads instead of 32.
+pub fn fssm_wave64(f: &super::xbox::Fssm, code: &[u8]) -> bool {
+    !f.wave32() && detect_wave64(code)
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;
@@ -1456,7 +1538,7 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk with constants earlier in its block, those words.
+/// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
@@ -1475,6 +1557,8 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
         let set: Vec<(u64, u32)> = match d.inst.name {
             "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
             "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+            // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
+            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
             // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
             "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
                 (Some(r), Some(c @ 128..=208)) => {
@@ -1497,6 +1581,34 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
+///
+/// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
+/// then reading what other groups wrote) relies on `GLC`/`DLC`/`SLC`, memory atomics, or
+/// cache invalidation on the console. Programs without any of those only access read-only
+/// or disjointly written memory within the dispatch, so keeping their flat memory windows
+/// un-qualified lets the GPU cache them in L1.
+pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return true;
+        }
+        matches!(
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
@@ -1506,6 +1618,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     } else {
         opt
     };
+    if !valid_window_count(opt.mem_windows as usize, opt.heap_windows) {
+        return Err(format!("unsupported shader memory layout: {} windows (heap: {})", opt.mem_windows, opt.heap_windows));
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1544,12 +1659,19 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
+    if !opt.rodata.is_empty() {
+        em.code_loads = code_loads::code_loads(&insts);
+    }
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
@@ -1559,6 +1681,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
+    }
+    if !opt.wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        em.reductions = wave32_reductions(&insts, &leaders);
     }
     em.max_vgpr = insts
         .iter()
@@ -1576,12 +1701,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
-        for (i, d) in insts.iter().enumerate() {
-            let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
-                break;
-            }
-        }
+        em.emit_insts(&insts, u64::MAX);
         body.push_str(&em.take());
         blocks = 1;
     } else {
@@ -1657,6 +1777,87 @@ mod attribute_tests {
         // no table: the attr-th register
         let ps = PsInterface { inputs, ..Default::default() };
         assert_eq!(ps_attribute_slot(&ps, 1, 0), Some(1));
+    }
+
+    /// A signature with float16 elements (component type 6) between float ones, in the shapes a
+    /// retail title's PS / MS pack: r7 holds two elements, r9 a single component.
+    fn f16_sig() -> Vec<SigElement> {
+        let e = |name: &str, index: u32, ct: u32, register: u32, mask: u8| SigElement { component_type: ct, mask, ..input(name, index, register, mask) };
+        let mut pos = input("SV_Position", 0, 0, 0);
+        pos.system_value = 1;
+        vec![
+            pos,
+            e("COLOR", 0, 6, 1, 0xF),
+            e("COLOR", 1, 6, 2, 0xF),
+            e("TEXCOORD", 0, 3, 3, 0x3),
+            e("TEXCOORD", 1, 6, 4, 0x7),
+            e("TEXCOORD", 4, 6, 5, 0xF),
+            e("TEXCOORD", 3, 3, 6, 0xF),
+            e("TEXCOORD", 7, 6, 7, 0x3),
+            e("TEXCOORD", 8, 6, 7, 0xC),
+            e("TEXCOORD", 9, 6, 8, 0x7),
+            e("TEXCOORD", 14, 6, 9, 0x1),
+        ]
+    }
+
+    /// Float16 interpolants packed two per dword and two registers per attribute (the record
+    /// shapes of a retail title's PS, FSSM sub-version 6): the table parses, each (dword, half)
+    /// names its element and component, the second register is found where the record does not
+    /// name it, and the attributes after a pair keep their registers.
+    #[test]
+    fn f16_packed_attributes() {
+        let sig = f16_sig();
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        // PS input records: [6, reg, 3, attr, 0, reg2, packed register, 0x1a]; attr 4 repeats
+        // its own register (the second one is r8); attr 5 is a single float16 (0x0a)
+        let recs: [[u8; 8]; 6] = [[6, 1, 3, 0, 0, 2, 1, 26], [6, 3, 3, 1, 0, 0, 2, 2], [6, 4, 3, 2, 0, 5, 3, 26], [6, 6, 15, 3, 0, 0, 4, 2], [6, 7, 3, 4, 0, 7, 5, 26], [6, 9, 1, 5, 0, 0, 6, 10]];
+        f[0x138..0x138 + 48].copy_from_slice(&recs.concat());
+        f[0x138 + 0x100] = 6;
+        f[0x138 + 0x110] = 2;
+        let (_, attrs) = ps_input_table(&f).unwrap();
+        assert_eq!(attrs.iter().map(|a| (a.register, a.f16, a.pair)).collect::<Vec<_>>(), [(1, true, Some(2)), (3, false, None), (4, true, Some(5)), (6, false, None), (7, true, Some(7)), (9, true, None)]);
+        let ps = PsInterface { inputs: sig, attrs: Some(attrs), ..Default::default() };
+        assert_eq!((0..6).map(|a| ps_attribute_f16(&ps, a)).collect::<Vec<_>>(), [Some(vec![(1, 0), (2, 2)]), None, Some(vec![(4, 0), (5, 2)]), None, Some(vec![(7, 0), (8, 2)]), Some(vec![(9, 0)])]);
+        let all = ranked(&ps.inputs, false);
+        // "semantic.component" of a (dword, half)
+        let at = |attr: usize, chan: usize, high: bool| ps_f16_slot(&ps, &ps_attribute_f16(&ps, attr).unwrap(), chan, high).map(|(s, c)| format!("{}.{c}", all[s].semantic())).unwrap_or_default();
+        assert_eq!([at(0, 0, false), at(0, 0, true), at(0, 1, true), at(0, 2, false), at(0, 3, true)], ["COLOR0.0", "COLOR0.1", "COLOR0.3", "COLOR1.0", "COLOR1.3"]);
+        assert_eq!([at(2, 1, false), at(2, 2, true)], ["TEXCOORD1.2", "TEXCOORD4.1"]);
+        // two elements in the first register; a half past the last one's components
+        assert_eq!([at(4, 0, true), at(4, 1, true), at(4, 2, false)], ["TEXCOORD7.1", "TEXCOORD8.3", "TEXCOORD9.0"]);
+        assert_eq!([at(5, 0, false), at(5, 2, false)], ["TEXCOORD14.0", ""]);
+        // the attributes after a pair read their own registers
+        assert_eq!([1, 3].map(|a| all[ps_attribute_slot(&ps, a, 0).unwrap()].semantic()), ["TEXCOORD0", "TEXCOORD3"]);
+        assert_eq!((0..10).map(|j| ps_slot_attribute(&ps, j)).collect::<Vec<_>>(), [0, 0, 1, 2, 2, 3, 4, 4, 4, 5].map(Some));
+        // a second register without the float16 flag is not this table
+        f[0x138 + 7] = 18;
+        assert_eq!(ps_input_table(&f), None);
+
+        // a .xy register takes one dword: the second register starts at dword 1
+        let narrow = vec![SigElement { component_type: 6, mask: 0x3, ..input("COLOR", 3, 1, 0x3) }, SigElement { component_type: 6, mask: 0x7, ..input("TEXCOORD", 8, 2, 0x7) }];
+        assert_eq!(f16_registers(&narrow, 1, None, true, &|r| r == 1), [(1, 0), (2, 1)]);
+    }
+
+    /// Float16 params packed the same way in a VS / MS output table (the record shapes of the
+    /// title's MS): the table parses, the second register of a pair is the next float16 register
+    /// that starts no param of its own (the record does not name it), and `exp param N` writes
+    /// the elements of both registers.
+    #[test]
+    fn f16_packed_params() {
+        let sig = f16_sig();
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        // VS / MS output records: [6, reg, param, reg, 0, 3]; param 5 is a single float16 (1)
+        let outs: [[u8; 6]; 6] = [[6, 1, 0, 1, 0, 3], [6, 3, 1, 0, 0, 0], [6, 4, 2, 4, 0, 3], [6, 6, 3, 0, 0, 0], [6, 7, 4, 7, 0, 3], [6, 9, 5, 0, 0, 1]];
+        f[0x1DC..0x1DC + 36].copy_from_slice(&outs.concat());
+        f[0x1DC + 0xC0] = 6;
+        let params = vs_output_table(&f).unwrap();
+        assert_eq!(params.iter().map(|p| (p.register, p.f16, p.pair)).collect::<Vec<_>>(), [(1, true, true), (3, false, false), (4, true, true), (6, false, false), (7, true, true), (9, true, false)]);
+        let regs = |n: usize| out_param_registers(&sig, Some(&params), n);
+        assert_eq!([regs(0), regs(1), regs(4), regs(5), regs(6)], [Some((vec![(1, 0), (2, 2)], true)), Some((vec![(3, 0)], false)), Some((vec![(7, 0), (8, 2)], true)), Some((vec![(9, 0)], true)), None]);
+        // elements in `ranked` order: r7 holds two, r8 one
+        assert_eq!(out_param_elements(&sig, Some(&params), 4), (vec![(6, 0), (7, 0), (8, 2)], true));
     }
 
     /// Minecraft's UI vertex shader: an ISG1 input the program never reads (NORMAL0, r1) gets

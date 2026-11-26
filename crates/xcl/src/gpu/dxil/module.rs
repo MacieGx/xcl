@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+pub(super) mod split;
 
 // ---------------------------------------------------------------- types
 
@@ -59,6 +60,7 @@ enum ConstDef {
     Aggregate(Ty, Vec<Value>),
 }
 
+#[derive(Clone)]
 struct FuncDecl {
     name: String,
     ty: Ty,
@@ -93,6 +95,7 @@ impl FnAttrs {
     }
 }
 
+#[derive(Clone)]
 struct GlobalDef {
     name: String,
     /// Value type (the global itself is a pointer to it).
@@ -589,6 +592,16 @@ impl Module {
         self.push(Op::Bin(op, a, b, flags), t)
     }
     pub fn cast(&mut self, op: CastOp, v: Value, to: Ty) -> Value {
+        let v = if op == CastOp::SExt
+            && self.int_width(to) == Some(64)
+            && self.type_ids.get(&TypeDef::Int(1)).copied().is_some_and(|i1| self.type_of(v) == i1)
+        {
+            // Direct i1 -> i64 sign extension loses the high word on the RX 6800M.
+            let i32 = self.i32();
+            self.push(Op::Cast(CastOp::SExt, v, i32), i32)
+        } else {
+            v
+        };
         self.push(Op::Cast(op, v, to), to)
     }
     pub fn bitcast(&mut self, v: Value, to: Ty) -> Value {
@@ -1003,10 +1016,11 @@ impl Module {
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
+        let mut operands = Vec::new();
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos);
+                self.write_inst(&mut w, i, inst_id, &abs, &pos, &mut operands);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -1157,7 +1171,15 @@ impl Module {
         }
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &[Option<u32>]) {
+    fn write_inst(
+        &self,
+        w: &mut BitWriter,
+        i: usize,
+        inst_id: u64,
+        abs: &dyn Fn(Value) -> u64,
+        pos: &[Option<u32>],
+        ops: &mut Vec<u64>,
+    ) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
@@ -1174,13 +1196,14 @@ impl Module {
                 0
             }
         };
+        ops.clear();
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
-                let mut ops = vec![rel(*a), rel(*b), *op as u64];
+                ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
                 if *flags != 0 {
                     ops.push(*flags);
                 }
-                w.record(FUNC_CODE_INST_BINOP, &ops)
+                w.record(FUNC_CODE_INST_BINOP, ops)
             }
             Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
@@ -1188,18 +1211,18 @@ impl Module {
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
-                let mut ops = vec![0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))];
+                ops.extend_from_slice(&[0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))]);
                 ops.extend(args.iter().map(|&a| rel(a)));
-                w.record(FUNC_CODE_INST_CALL, &ops)
+                w.record(FUNC_CODE_INST_CALL, ops)
             }
             Op::Phi(inc) => {
-                let mut ops = vec![self.insts[i].ty.0 as u64];
+                ops.push(self.insts[i].ty.0 as u64);
                 // incoming edges from unreachable (unwritten) blocks are dropped
                 for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_PHI, &ops)
+                w.record(FUNC_CODE_INST_PHI, ops)
             }
             Op::Load(p, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
@@ -1212,9 +1235,9 @@ impl Module {
             Op::Gep(p, idx) => {
                 let pt = self.value_ty(*p);
                 let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
-                let mut ops = vec![1, src.0 as u64, rel(*p)];
+                ops.extend_from_slice(&[1, src.0 as u64, rel(*p)]);
                 ops.extend(idx.iter().map(|&v| rel(v)));
-                w.record(FUNC_CODE_INST_GEP, &ops)
+                w.record(FUNC_CODE_INST_GEP, ops)
             }
             Op::AtomicRmw(op, p, v) => {
                 // [ptr, val, op, vol, ordering, synchscope (crossthread = 1)]
@@ -1233,12 +1256,12 @@ impl Module {
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
-                let mut ops = vec![self.value_ty(*v).0 as u64, rel(*v), bb(*d)];
+                ops.extend_from_slice(&[self.value_ty(*v).0 as u64, rel(*v), bb(*d)]);
                 for &(c, b) in cases {
                     ops.push(abs(c));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_SWITCH, &ops)
+                w.record(FUNC_CODE_INST_SWITCH, ops)
             }
             Op::Ret => w.record(FUNC_CODE_INST_RET, &[]),
             Op::Unreachable => w.record(FUNC_CODE_INST_UNREACHABLE, &[]),
@@ -1417,6 +1440,18 @@ impl Module {
             ops.into_iter().any(|v| self.value_ty(v) == t)
         })
     }
+    /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
+    pub fn has_rov_handle(&self) -> bool {
+        self.blocks.iter().flatten().any(|&i| {
+            let Op::Call(f, args) = &self.insts[i as usize].op else { return false };
+            if self.funcs[*f as usize].name != "dx.op.annotateHandle" || args.len() < 3 {
+                return false;
+            }
+            let Value::Const(c) = args[2] else { return false };
+            let ConstDef::Aggregate(_, fields) = &self.consts[c as usize] else { return false };
+            fields.first().and_then(|&p0| self.const_u64(p0)).is_some_and(|w| w & 0x2000 != 0)
+        })
+    }
     /// The integer value of a constant (zero-extended from its width).
     pub fn const_u64(&self, v: Value) -> Option<u64> {
         match v {
@@ -1500,5 +1535,38 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_extension_does_not_intern_unrelated_integer_types() {
+        let mut wide = Module::new();
+        let signed = wide.i32c(u32::MAX);
+        let i64 = wide.i64();
+        wide.cast(CastOp::SExt, signed, i64);
+        assert!(!wide.type_ids.contains_key(&TypeDef::Int(1)));
+
+        let mut narrow = Module::new();
+        let bit = narrow.i1c(true);
+        let i16 = narrow.int(16);
+        narrow.cast(CastOp::SExt, bit, i16);
+        assert!(!narrow.type_ids.contains_key(&TypeDef::Int(64)));
+    }
+
+    #[test]
+    fn sign_extension_from_i1_to_i64_still_uses_i32() {
+        let mut module = Module::new();
+        let bit = module.i1c(true);
+        let i64 = module.i64();
+        module.cast(CastOp::SExt, bit, i64);
+
+        let [first, second] = module.insts.as_slice() else { panic!("expected two casts") };
+        assert!(matches!(first.op, Op::Cast(CastOp::SExt, source, ty)
+            if source == bit && module.int_width(ty) == Some(32)));
+        assert!(matches!(second.op, Op::Cast(CastOp::SExt, Value::Inst(0), ty) if ty == i64));
     }
 }

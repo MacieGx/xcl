@@ -8,6 +8,7 @@ pub mod bvh;
 pub mod desc;
 pub mod dxbc;
 pub mod dxil;
+pub mod effects;
 pub(crate) mod fence;
 pub mod pack;
 pub mod rdna2;

@@ -9,9 +9,9 @@
 //! `recomp::CsInterface`): user SGPRs from `io`, then the enabled group ids
 //! and TG_SIZE; v0..v2 = thread id in the group; results only through memory.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::cfg::{Cfg, CfgOp, Term};
+use super::cfg::{Cfg, Term};
 use super::container::Stage;
 use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
@@ -35,36 +35,10 @@ pub struct KernelOptions {
 }
 
 /// Version of the direct translator's output, part of the on-disk translation cache's
-/// identity (`recomp::pso`): bump it on any change that alters the emitted containers
+/// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
+/// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 10;
-
-/// Flag in `KernelOptions::mem_windows` (next to `recomp::HEAP_WINDOWS`; part of a compute
-/// program's cache key, `pso::console_to_dxil_in`): accesses take their base address's window
-/// (`lower_window::window_at`). From xcl-dev/xcl pull request 2496 (`XCL_WINDOW_NO_CARRY=1`).
-pub const WINDOW_NO_CARRY: u32 = 0x400;
-
-/// Lab flag in `KernelOptions::mem_windows` (part of the program's cache key): the compute
-/// program's group id is folded – x = SV_GroupID.x + SV_GroupID.y * `FOLD_ROW`, y = 0 – so that a
-/// 1-D dispatch of more groups than D3D12 takes in a dimension (65535) runs as rows
-/// (`XCL_FOLD_GROUPS`, `indirect_clamp`). The idea of running the surplus as rows is VIctory's
-/// (GPL-3.0; no code taken).
-pub const FOLD_GROUPS: u32 = 0x1000;
-/// groups in a row of a folded dispatch. The last row is whole too: up to `FOLD_ROW` - 1 groups
-/// past the ones the title asked for run as well (the program is not told how many were asked)
-pub const FOLD_ROW: u32 = 1024;
-
-/// Lab (`XCL_FOLD_GROUPS=<cs record hash>,...`): the compute programs whose group id is folded.
-pub fn fold_groups(record: u64) -> bool {
-    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    SET.get_or_init(|| std::env::var("XCL_FOLD_GROUPS").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect()).contains(&record)
-}
-
-/// `XCL_WINDOW_NO_CARRY=1`: compute programs take an access's memory window from its base address.
-pub fn window_no_carry() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_WINDOW_NO_CARRY").is_ok_and(|v| v.trim() == "1"))
-}
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -91,32 +65,89 @@ pub fn translate(code: &[u8], o: KernelOptions) -> Result<Vec<u8>, String> {
 pub struct Kernel {
     pub dxil: Vec<u8>,
     pub static_samplers: Vec<([u32; 4], bool)>,
+    pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
+}
+
+pub use super::module::split::DispatchChain;
+
+pub fn dispatch_piece_limit() -> usize {
+    std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
+}
+
+/// Lab flag in `KernelOptions::mem_windows` (part of the program's cache key): the compute
+/// program's group id is folded – x = SV_GroupID.x + SV_GroupID.y * `FOLD_ROW`, y = 0 – so that a
+/// 1-D dispatch of more groups than D3D12 takes in a dimension (65535) runs as rows
+/// (`XCL_FOLD_GROUPS`, `indirect_clamp`). The idea of running the surplus as rows is VIctory's
+/// (GPL-3.0; no code taken).
+pub const FOLD_GROUPS: u32 = 0x1000;
+/// groups in a row of a folded dispatch. The last row is whole too: up to `FOLD_ROW` - 1 groups
+/// past the ones the title asked for run as well (the program is not told how many were asked)
+pub const FOLD_ROW: u32 = 1024;
+
+/// Lab (`XCL_FOLD_GROUPS=<cs record hash>,...`): the compute programs whose group id is folded.
+pub fn fold_groups(record: u64) -> bool {
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::env::var("XCL_FOLD_GROUPS").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect()).contains(&record)
+}
+
+/// `XCL_WINDOW_NO_CARRY=1`: memory accesses take their base's window (`lower_window::no_carry`).
+pub fn window_no_carry() -> bool {
+    super::lower_window::no_carry()
+}
+
+#[cfg(test)]
+pub use super::lower_window::with_no_carry;
+
+/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
+pub fn compact_mode() -> Option<bool> {
+    match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Non-default `XCL_DIRECT_COMPACT_NEST` cache tag for the translated cache identity.
+pub fn compact_nest_tag() -> Option<String> {
+    super::compact::nest_mode().cache_tag()
+}
+
+/// `translate_full` in the compact form (`compact = true`) or the plain one.
+#[cfg(test)]
+pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Kernel, Some(compact), None, super::compact::TABLE_WORDS_WAVE32)
+}
+
+/// `translate_full` in the compact form with an explicit dispatch nesting policy.
+#[cfg(test)]
+pub fn translate_full_nested(code: &[u8], o: KernelOptions, nest: super::compact::Nest) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest), super::compact::TABLE_WORDS_WAVE32)
 }
 
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel)
+    translate_entry(code, o, Entry::Kernel, compact_mode(), None, super::compact::TABLE_WORDS_WAVE32)
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()))
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()))
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None, 0)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()))
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None, 0)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()))
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
 
 /// The entry ABI.
@@ -132,26 +163,58 @@ pub enum Entry {
 
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Compute(cs.clone()))
+    translate_compute_on(code, o, cs, true)
 }
 
-fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
-    translate_entry_rodata(code, o, entry, &[])
+/// `translate_compute` for a GPU: one that runs only 32-lane waves takes larger compact tables.
+pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
+    let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
+    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
+}
+
+fn translate_entry(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, tables, Vec::new())
 }
 
 /// A program at `entry` with the constant data the console compiler put after it in the code
 /// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
 /// compiler's offset is its address, and dword loads at such an address read the table the
-/// module carries (`Lw::rodata_loads`).
-pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
-    let rodata = rodata.to_vec();
+/// module carries (`Lw::rodata_loads`). `wave32_only`: as `translate_compute_on` (compute only).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, wave32_only: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    let tables = match entry {
+        Entry::Compute(_) if !wave32_only => super::compact::TABLE_WORDS,
+        Entry::Kernel | Entry::Compute(_) => super::compact::TABLE_WORDS_WAVE32,
+        _ => 0,
+    };
+    translate_entry_with(code, o, entry, compact, None, tables, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    // the caller's `no_carry` (a test may set it for its own thread)
+    let no_carry = super::lower_window::no_carry();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, rodata))
+        .spawn(move || super::lower_window::with_no_carry(no_carry, || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata)))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -166,7 +229,8 @@ pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodat
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | WINDOW_NO_CARRY | FOLD_GROUPS)).clamp(1, 4);
+    let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | FOLD_GROUPS)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -174,23 +238,38 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
-fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata: Vec<(u32, Vec<u32>)>) -> Result<Kernel, String> {
+fn translate_on_this_thread(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
     };
-    let kernel = matches!(entry, Entry::Kernel);
     let cfg = match &geo {
         Some(g) => Cfg::build_geometry(code, g.gs_start)?,
-        None => Cfg::build_for(code, o.wave64, kernel)?,
+        None => Cfg::build(code)?,
     };
+    let kernel = matches!(entry, Entry::Kernel);
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+    let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
-    let mut lw = Lw::new(&cfg.insts, &cfg.orig_leaders, o, &entry, true);
+    let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry, true);
+    if !rodata.is_empty() {
+        lw.code_loads = crate::gpu::recomp::code_loads::code_loads(&cfg.insts);
+    }
     lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
+    let mut split_tid = None;
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -203,6 +282,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
         }
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
+            if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
             compute_init(&mut lw, cs, tid, gtid);
             cs.threads
         }
@@ -258,6 +338,15 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
         }
     }
 
+    let plan = match compact {
+        _ if !compute && !kernel => None,
+        Some(false) => None,
+        Some(true) => super::compact::plan(&cfg, &lw),
+        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+    };
+    if let Some(p) = &plan {
+        crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
+    }
     let n = cfg.blocks.len();
     let mut heads: Vec<Option<Block>> = vec![None; n];
     let entry = *cfg.rpo.first().ok_or("empty program")?;
@@ -291,7 +380,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
         lw.partner = Partner::Missing;
         lw.xn = lw.c(0);
     }
-    let h0 = head(&mut lw, entry);
+    let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
     if gs_only {
         // the GS alone: in the lower hardware wave only
@@ -304,9 +393,17 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
         lw.edge(Block(0), h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
+    // scalar loads the program repeats keep their first values (compute programs and kernels:
+    // the other stages enter their code by edges the CFG does not hold)
+    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
-    let mut saved_execz: HashMap<u32, (Value, Vec<(u32, Value)>)> = HashMap::new();
-    for &b in &cfg.rpo {
+    if let Some(p) = &plan {
+        match nest {
+            Some(n) => super::compact::emit_with_nest(&mut lw, &cfg, p, h0, exit, n)?,
+            None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
+        }
+    }
+    for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
         let es_block = two_phase && !in_gs(b);
@@ -331,32 +428,11 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
         }
-        for op in &cfg.blocks[b].ops {
-            match op {
-                CfgOp::Inst(i) => lw.inst(&cfg.insts[*i])?,
-                CfgOp::SaveExecZ { id, regs } => {
-                    let lo = lw.sreg(126);
-                    let mask = if lw.wave64 {
-                        let hi = lw.sreg(127);
-                        lw.or(lo, hi)
-                    } else {
-                        lo
-                    };
-                    let was_zero = lw.cmpc(Pred::Eq, mask, 0);
-                    let snap: Vec<(u32, Value)> = regs.iter().map(|&r| (r, lw.rd(r))).collect();
-                    saved_execz.insert(*id, (was_zero, snap));
-                }
-                CfgOp::RestoreIfExecZ { id, regs } => {
-                    let (was_zero, snap) = saved_execz.remove(id).expect("paired SaveExecZ");
-                    debug_assert_eq!(snap.len(), regs.len());
-                    for (r, old) in snap {
-                        let cur = lw.rd(r);
-                        let v = lw.sel(was_zero, old, cur);
-                        lw.wr(r, v);
-                    }
-                }
-            }
+        for &i in &cfg.blocks[b].insts {
+            lw.reload = reloads.get(b, i);
+            lw.inst(&cfg.insts[i])?;
         }
+        lw.reload = None;
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
                 // the ES's s_setpc_b64 into the GS: through the phase switch
@@ -430,7 +506,30 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, rodata:
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    lw.finish(numthreads, hw)
+    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
+    lw.finish_dispatch(numthreads, hw, limit, split_tid)
+}
+
+/// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
+/// reads `src_pops_exiting_wave_id` (operand 239) or accesses `HW_REG_POPS_PACKER`
+/// (hardware register 25 via `S_GETREG_B32` / `S_SETREG*`).
+fn uses_pops(insts: &[Decoded]) -> bool {
+    const SRC_POPS_EXITING_WAVE_ID: u64 = 239;
+    const HW_REG_POPS_PACKER: u64 = 25;
+    insts.iter().any(|d| {
+        if matches!(d.inst.name, "S_GETREG_B32" | "S_SETREG_B32" | "S_SETREG_IMM32_B32")
+            && crate::gpu::rdna2::field_value(d.enc, &d.words, "SIMM16").is_some_and(|v| (v & 0x3F) == HW_REG_POPS_PACKER)
+        {
+            return true;
+        }
+        d.ienc.operands.iter().any(|o| {
+            let Some(f) = o.field else { return false };
+            o.input
+                && !o.implicit
+                && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_SSRC"))
+                && crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(SRC_POPS_EXITING_WAVE_ID)
+        })
+    })
 }
 
 impl Lw {
@@ -464,13 +563,17 @@ impl Lw {
         let mut s = Shader::new(stage, (6, 6));
         let io = s.raw_uav(0, 0);
         let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
+        if stage == Stage::Pixel && uses_pops(insts) {
+            s.enable_rov();
+        }
+        let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
             s,
             ssa: Ssa::new(i32),
-            init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new() },
+            init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new(), slots: HashMap::new(), mem: None },
             wave64: o.wave64,
             split,
             lane: z,
@@ -479,14 +582,14 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
-            no_carry: o.mem_windows & WINDOW_NO_CARRY != 0,
-            fold_groups: o.mem_windows & FOLD_GROUPS != 0,
             res,
             fmt_table: None,
             rodata: Vec::new(),
             rodata_table: None,
+            code_loads: BTreeMap::new(),
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
+            reload: None,
             uma_base_val: None,
             ntmp: 0,
             scratch: None,
@@ -495,7 +598,9 @@ impl Lw {
             sampler_base: o.sampler_base,
             dyn_rm: false,
             f32_rm: false,
+            track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
+            img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,
@@ -515,6 +620,8 @@ impl Lw {
             whole_live: Default::default(),
             guard_override: None,
             mask_override: None,
+            local_masks: false,
+            fold_groups: o.mem_windows & FOLD_GROUPS != 0,
             exchange_error: None,
             pc: 0,
             sbar: super::group_barrier::SBarrier::Sync,
@@ -584,15 +691,24 @@ impl Lw {
     /// The finished container and the static samplers the program bound, once every block
     /// is closed: `numthreads` and the hardware wave size `hw` for a compute-like entry, the
     /// stage's I/O for a VS / PS.
-    pub fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+    pub fn finish(self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+        self.finish_dispatch(numthreads, hw, 0, None)
+    }
+
+    fn finish_dispatch(mut self, numthreads: [u32; 3], hw: u32, limit: usize, split_tid: Option<Value>) -> Result<Kernel, String> {
         if let Some(e) = self.exchange_error.take() {
             return Err(e);
         }
         let stage = self.s.stage;
+        let mut dispatch_chain = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
+        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+            self.s.m.optimize();
+            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
         }
@@ -603,8 +719,52 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
-        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect() })
+        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn dispatch_chain_native_wave64_builds_whole() {
+    use crate::gpu::recomp::runner;
+
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs), false);
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let width = lw.s.wave_lane_count();
+    let mem = lw.mems[0];
+    // conditional updates: blocks the optimiser cannot merge into one
+    for _ in 0..40 {
+        let update = lw.s.m.new_block();
+        let join = lw.s.m.new_block();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, width);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.s.m.br(join);
+        lw.s.m.set_block(join);
+    }
+    lw.s.m.ret();
+    lw.s.m.optimize();
+    // Exercise the native-wave admission gate with an otherwise partitionable CFG.
+    assert!(lw.s.m.dispatch_plan(64).is_some());
+    let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
+    assert!(program.dispatch_chain.is_none());
+    super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");
+
+    if !runner::wave64_supported().unwrap_or(false) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let initial: Vec<u32> = (1..=64).collect();
+    let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
+    let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
+    assert_eq!(result, expected);
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
@@ -661,8 +821,8 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let total: u32 = cs.threads.iter().product();
     if cs.tg_size {
-        // (threads / lanes) | (gi / lanes) << 6
-        let w = lw.c(total / lanes);
+        // the group's wave count (a partial last wave counts) | (gi / lanes) << 6
+        let w = lw.c(total.div_ceil(lanes));
         let l = lw.c(lanes);
         let i = lw.bin(super::module::BinOp::UDiv, tid, l);
         let i = lw.shlc(i, 6);
@@ -830,12 +990,19 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let nreg = g.input_registers();
     let fetched = fetched_registers(&g.es_inputs);
     let in_nv = lw.cmp(Pred::ULt, lane, nv);
-    let mem = lw.mems[0];
+    let mut mem = None;
     for &v in used.iter().filter(|&&v| (9..256).contains(&v)) {
         let k = ((v - 9) / 4) as usize;
         if k >= fetched.len() || fetched[k] >= nreg {
             continue;
         }
+        let mem = *mem.get_or_insert_with(|| match lw.heap_mem {
+            Some(coherent) => {
+                let idx = lw.c(crate::gpu::recomp::MEM_HEAP_BASE);
+                lw.s.heap_raw_buffer_uav(idx, coherent)
+            }
+            None => lw.mems[0],
+        });
         let (r, c) = (fetched[k], ((v - 9) % 4) as u32);
         // mem.Load(vin + ((p0 * 3 + lane) * nreg + r) * 16 + 4c), 0 past the group's vertices
         let kn = lw.c(nreg);

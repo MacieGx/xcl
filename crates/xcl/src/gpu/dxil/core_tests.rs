@@ -14,20 +14,6 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     v
 }
 
-/// A program with heap windows reaches every window descriptor of the shared heap – the
-/// unified block's and the view windows after them (`d3d12x::view_mem`) – as the HLSL path's
-/// accessors do; without the heap only the unified block's windows.
-#[test]
-fn heap_windows_reach_the_view_windows() {
-    use super::lower_mem::heap_window_bound;
-    let slots = crate::gpu::recomp::HEAP_WINDOW_SLOTS;
-    assert!(slots as usize >= crate::gpu::uma::MAX_WINDOWS);
-    for mems in 2..=crate::gpu::uma::MAX_WINDOWS {
-        assert_eq!(heap_window_bound(mems), slots, "{mems} unified windows");
-    }
-    assert_eq!(heap_window_bound(slots as usize + 1), slots + 1, "never fewer than the program's own");
-}
-
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
@@ -167,15 +153,16 @@ fn direct_and_hlsl_graphics_stages_link() {
     assert_eq!(draw(&hvs, &dps), want, "HLSL VS + direct PS");
 }
 
-/// Float16 interpolants packed two per dword, two registers in one param (TEXCOORD1.xyz and
-/// TEXCOORD4.xyzw in param 0, as a retail title's world shaders have them): the VS exports
-/// the packed dwords, the PS reads each half with `v_interp_p2_f16` (SRC0 bit 8: the high
-/// half) and gets that component interpolated across the triangle; the float param after
-/// the pair keeps its register. Every combination of the direct and the HLSL stages. Before:
-/// the tables were refused, the PS converted the raw packed dword of a `nointerpolation`
-/// input and param 1 was read from TEXCOORD4.
+/// Float16 interpolants packed two per dword, two registers in one attribute (TEXCOORD1.xyz
+/// and TEXCOORD4.xyzw in attribute 0, as a retail title's world shaders have them): the PS
+/// reads each half with `v_interp_p2_f16` (SRC0 bit 8: the high half) and gets that component
+/// of its own element interpolated across the triangle; the float attribute after the pair
+/// keeps its register. The console VS exports the packed dwords as param 0 and unpacks them
+/// into the same components. Every combination of the direct and the HLSL stages, and a PC VS.
+/// Before: the tables were refused, the PS converted the raw packed dword of a
+/// `nointerpolation` input and attribute 1 was read from TEXCOORD4.
 #[test]
-fn f16_packed_params_interpolate_per_half() {
+fn f16_packed_attributes_interpolate_per_half() {
     use crate::gpu::dxbc::SigElement as S;
     use crate::gpu::recomp::{runner, translate, Mode, Options, OutParam, PsAttr, PsInterface, VsInterface};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
@@ -213,6 +200,10 @@ fn f16_packed_params_interpolate_per_half() {
         attr_base: 4,
         params: Some(vec![OutParam { register: 1, f16: true, pair: true }, OutParam { register: 3, f16: false, pair: false }]),
     };
+    // a PC VS handing over each component as a float: COLOR c -> TEXCOORD1 = (c0, c1, c2, 0),
+    // TEXCOORD4 = (c3, c0, c1, c2), TEXCOORD3 = c reversed
+    let pc_vs = "struct I { float2 pos : POSITION; float4 c : COLOR0; };\nstruct O { float4 pos : SV_Position; float4 t1 : TEXCOORD1; float4 t4 : TEXCOORD4; float4 t3 : TEXCOORD3; };\nO main(I i) { O o; o.pos = float4(i.pos, 0.0, 1.0); o.t1 = float4(i.c.xyz, 0.0); o.t4 = float4(i.c.w, i.c.xyz); o.t3 = i.c.wzyx; return o; }\n";
+    let pvs = crate::gpu::recomp::dxc::compile(pc_vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pc_vs}"));
     let psi = PsInterface {
         inputs: std::iter::once(el("SV_Position", 0, 1, 3, 0, 0xF)).chain(user.iter().cloned()).collect(),
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
@@ -262,7 +253,7 @@ fn f16_packed_params_interpolate_per_half() {
         ([Some((0, 0)), Some((0, 1)), Some((1, 0)), Some((2, 0))], [0, 1, 2, 3], "TEXCOORD1.xyz, TEXCOORD4.x"),
         ([Some((2, 1)), Some((3, 0)), Some((3, 1)), Some((1, 1))], [0, 1, 2, 4], "TEXCOORD4.yzw, TEXCOORD1.w"),
         ([Some((3, 1)), Some((2, 0)), Some((0, 1)), Some((0, 0))], [2, 3, 1, 0], "both registers, mixed halves"),
-        ([None, None, None, None], [3, 2, 1, 0], "the float param after the pair"),
+        ([None, None, None, None], [3, 2, 1, 0], "the float attribute after the pair"),
     ];
     for (sel, want, what) in cases {
         let code = ps_code(sel);
@@ -271,7 +262,8 @@ fn f16_packed_params_interpolate_per_half() {
         assert!(!pt.hlsl.contains("nointerpolation"), "{what}: the float16 inputs interpolate\n{}", pt.hlsl);
         let hps = crate::gpu::recomp::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
         let dps = super::kernel::translate_pixel(&code, ko, &psi).unwrap().dxil;
-        for (stages, vs, ps) in [("HLSL VS + HLSL PS", &hvs, &hps), ("direct VS + direct PS", &dvs, &dps), ("direct VS + HLSL PS", &dvs, &hps), ("HLSL VS + direct PS", &hvs, &dps)] {
+        let pairs = [("PC VS + HLSL PS", &pvs, &hps), ("PC VS + direct PS", &pvs, &dps), ("HLSL VS + HLSL PS", &hvs, &hps), ("direct VS + direct PS", &dvs, &dps), ("direct VS + HLSL PS", &dvs, &hps), ("HLSL VS + direct PS", &hvs, &dps)];
+        for (stages, vs, ps) in pairs {
             let px = runner::draw(vs, ps, &layout, &verts, 24, &[], &[], 8, [9.0; 4]).unwrap();
             for y in 0..8usize {
                 for x in 0..8usize {
@@ -543,6 +535,127 @@ fn multi_window_mem_format_and_bvh_validate() {
     }
 }
 
+/// Constant data after the program (`kernel::translate_entry_rodata`), as the HLSL kernel's
+/// `gpu_loads_read_the_constant_data_after_the_program`: `s_getpc_b64` plus the compiler's
+/// offset is its address, and `s_load` / `global_load` (with windows `s_buffer_load` too) read
+/// it from the module's table – with one window, two windows (switch) and heap windows, where
+/// window 0 holds other bytes at the table's offset. Any other address still reads the memory.
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program() {
+    direct_loads_read_the_constant_data(false);
+}
+
+/// As `gpu_direct_loads_read_the_constant_data_after_the_program`, with the memory a load
+/// through the same register pair reads at the table's low offset: with one window only the
+/// high dword of a code address tells them apart (thehollowedone on #2229).
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program_not_the_memory_at_its_offset() {
+    direct_loads_read_the_constant_data(true);
+}
+
+/// `at_the_table`: the memory s[2:3] points to has the table's low offset (one window only).
+fn direct_loads_read_the_constant_data(at_the_table: bool) {
+    use super::kernel::{translate_entry_rodata, Entry};
+    use crate::gpu::recomp::{runner, HEAP_WINDOWS};
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            // memory, not the data: v[12:13] and s[2:3]
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+            // the V# s[4:7] on the table
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 1)], None),
+            ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            // s[8:9]: the code address on one path, memory on the other – told at run time
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 0)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
+        ])
+    };
+    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
+    let mut data = vec![table.len() as u32];
+    data.extend(&table);
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    let split = runner::split_wave64();
+    let direct = |windows: u32, rodata: &[(u32, Vec<u32>)]| {
+        let o = KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 };
+        translate_entry_rodata(&code, o, Entry::Kernel, true, rodata).unwrap_or_else(|e| panic!("windows {windows:#x}: {}", &e[..e.len().min(800)]))
+    };
+    // (translations are validated in test builds)
+    let one = direct(1, &rodata).dxil;
+    assert_eq!(direct(1, &[]).dxil, translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap(), "no data, no table");
+    assert_ne!(one, direct(1, &[]).dxil);
+    match (runner::adapter(), runner::wave64_programs_supported()) {
+        (Ok(_), Ok(true)) => {}
+        (a, w) => return runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else { "no wave64" }),
+    }
+    let check = |r: &runner::KernelResult, buffer: [u32; 2], what: &str| {
+        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
+        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
+        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        assert_eq!(r.sgpr[21..23], [table[3], 4343], "{what}: s_load of the table, then of memory, through one register pair");
+        assert_eq!(r.sgpr[30..32], buffer, "{what}: s_buffer_load");
+        for l in 0..64usize {
+            let k = l % 6;
+            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
+            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+        }
+    };
+    // one window: nothing of the code is in the memory
+    let mut st = runner::KernelState::default();
+    st.sgpr[2] = if at_the_table { block + 4 } else { 0x900 };
+    st.sgpr[6] = 64;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[10] = 4 * (l as u32 % 6);
+        r[12] = 0x800 + 4 * l as u32;
+    }
+    let mut mem = vec![0u32; 1024];
+    let m = (st.sgpr[2] / 4) as usize;
+    mem[m..m + 3].copy_from_slice(&[4242, 4343, 4444]);
+    for l in 0..64 {
+        mem[0x200 + l] = 7000 + l as u32;
+    }
+    check(&runner::run(&one, &st, &mem).unwrap(), [table[1], table[2]], "one window");
+    if at_the_table {
+        return;
+    }
+    // several windows: a code address is in none of them, and window 0 holds other bytes at
+    // the table's offset
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..16u64 {
+        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
+    }
+    *word(w1 + 0x900) = 4242;
+    *word(w1 + 0x904) = 4343;
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
+        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
+        r[13] = (w1 >> 32) as u32;
+    }
+    for (windows, what) in [(2, "two windows"), (2 | HEAP_WINDOWS, "heap windows")] {
+        check(&runner::run_in_arena(&direct(windows, &rodata).dxil, &st, &arena).unwrap(), [table[1], table[2]], what);
+    }
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
@@ -570,67 +683,396 @@ fn ps_get_lod_with_a_static_sampler() {
     }
 }
 
-/// Collapsed forward `s_cbranch_execz` regions (triggered above the block threshold)
-/// produce bit-exact SGPRs, SCC, EXEC, and per-lane VGPRs matching the HLSL reference
-/// across EXEC == 0, partial EXEC, and full EXEC.
+/// Without a program-set `MODE[3:2]`, `v_cvt_f16_f32`, `v_mul_f16` and `v_pk_mul_f16`
+/// must round to nearest-even (matching RDNA2 and the HLSL path) rather than using
+/// `dx.op.legacyF32ToF16` (which rounds toward zero / flushes below the smallest f16 denormal).
 #[test]
-fn collapsed_execz_kernel_matches_hlsl_on_gpu() {
-    use crate::gpu::recomp::{self, runner::{self, KernelState}, Options};
-    let mut seq: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
-    // 70 repeated nested `s_cbranch_execz` blocks (> 128 blocks total so Pass 2 triggers).
-    // Each iteration saves EXEC, narrows via `s_and_saveexec_b64`, conditionally modifies
-    // v1, v2, live-out SGPR s10, and SCC, then restores EXEC via `s_mov_b64 exec, s[4:5]`.
-    for _ in 0..70 {
-        seq.push(("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)], None));
-        seq.push(("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 6)], None));
-        seq.push(("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 8)], None));
-        seq.push(("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 3)], None));
-        seq.push(("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)], None));
-        seq.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None));
-        seq.push(("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 10), ("VSRC1", 2)], None));
-        seq.push(("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 6)], None));
-        seq.push(("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)], None));
+fn f16_conversions_and_products_default_to_round_to_nearest_even() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+    ]);
+    let w32_dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let split_dxil = translate(&code, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let w64_dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    if let Ok(dis) = super::validate::disassemble(&w32_dxil) {
+        assert!(!dis.contains("legacyF32ToF16"), "default RNE f16 ops should not emit legacyF32ToF16:\n{dis}");
     }
-    let code = prog(&seq);
-    // Verify CFG actually collapsed to 1 block!
-    let cfg = super::cfg::Cfg::build_for(&code, true, true).unwrap();
-    assert_eq!(cfg.rpo.len(), 1, "expected 70 nested execz blocks to collapse to 1, got {}", cfg.rpo.len());
-    let split = runner::split_wave64() || runner::wave64_supported() != Ok(true);
-    let dxil = translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap();
-    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || recomp::dxc::location().is_err() {
+
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no wave32 or wave64 GPU");
+    }
+
+    let cvt_cases: [(f32, u16); 8] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0000), 0x0000),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    // Lane 0: 3072 * (1 + 2^-10) = 3075.0 (exact midpoint -> 0x6A02 / 0xEA02).
+    // Lane 1: 2^-24 * (0.5 + 2^-11) = 2^-25 + 2^-35 (above half smallest f16 denormal -> 0x0001 / 0x8001).
+    let mul_cases: [(u32, u32, u16, u32); 2] = [
+        (0xEA00_6A00, 0x3C01_3C01, 0x6A02, 0xEA02_6A02),
+        (0x8001_0001, 0x3801_3801, 0x0001, 0x8001_0001),
+    ];
+
+    let mut runs: Vec<(&str, &[u8], bool)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", &w32_dxil, false));
+        runs.push(("split-wave64", &split_dxil, true));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", &w64_dxil, true));
+    }
+    for (label, dxil, wave64) in runs {
+        let mut st = KernelState::default();
+        if !wave64 {
+            st.sgpr[127] = 0;
+        }
+        let bases: &[usize] = if wave64 { &[0, 32] } else { &[0] };
+        for &base in bases {
+            for (i, &(value, _)) in cvt_cases.iter().enumerate() {
+                st.vgpr[base + i][0] = value.to_bits();
+            }
+            for (i, &(a, b, _, _)) in mul_cases.iter().enumerate() {
+                st.vgpr[base + i][1] = a;
+                st.vgpr[base + i][2] = b;
+            }
+        }
+        let r = runner::run(dxil, &st, &[]).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for &base in bases {
+            let actual: [u16; 8] = std::array::from_fn(|i| r.vgpr[base + i][10] as u16);
+            let expected = cvt_cases.map(|(_, bits)| bits);
+            assert_eq!(actual, expected, "{label} base {base}: v_cvt_f16_f32 {actual:04x?} != {expected:04x?}");
+            for (i, &(_, _, want_mul, want_pk)) in mul_cases.iter().enumerate() {
+                let got_mul = r.vgpr[base + i][11] as u16;
+                let got_pk = r.vgpr[base + i][12];
+                assert_eq!(got_mul, want_mul, "{label} lane {}: v_mul_f16 {got_mul:04x} != {want_mul:04x}", base + i);
+                assert_eq!(got_pk, want_pk, "{label} lane {}: v_pk_mul_f16 {got_pk:08x} != {want_pk:08x}", base + i);
+            }
+        }
+    }
+}
+
+/// `s_setreg_b32 hwreg(HW_REG_MODE, 3, 1), s0` sets bit 3 of `MODE` (offset 3, dp_mask 2):
+/// lowering must not subtract `2 - off` before matching `dp_mask`, and the dynamic f16 rounding
+/// result must agree with HLSL on the GPU.
+#[test]
+fn s_setreg_b32_mode_bit3_does_not_underflow() {
+    use crate::gpu::recomp::{dxc, runner, Options};
+    // HW_REG_MODE (1), offset 3, size-1 = 0 -> 1 | (3 << 6) = 0x00C1
+    let code = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x00C1)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None),
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct DXIL failed: {e}"));
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut st = runner::KernelState::default();
+    st.sgpr[0] = 1; // MODE[3:2] = 0b10 (RTN, round toward -inf)
+    st.vgpr[0][1] = 0x3F80_0001; // +1.0 + 2^-23 -> 0x3C00
+    st.vgpr[1][1] = 0xBF80_0001; // -1.0 - 2^-23 -> 0xBC01
+    let direct = runner::run(&dxil, &st, &[]).unwrap();
+    let t = crate::gpu::recomp::translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (hlsl.vgpr[0][0], hlsl.vgpr[1][0]));
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (0x3C00, 0xBC01));
+}
+
+/// A 16-byte `buffer_store_format_xyzw` (32_32_32_32_FLOAT) at an address that is not
+/// dword aligned writes all four components; the bytes around it stay intact.
+#[test]
+fn gpu_direct_unaligned_multi_dword_format_store() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    // V# s[12:15] (SRSRC 3): base 0x100, stride 0, 64 bytes, format 77; lane 0 stores at +2
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let dxil = runner::direct_kernel(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave64");
         return;
     }
-    let hlsl = recomp::translate(&code, &Options { wave64: true, split_wave64: split, ..Default::default() }).unwrap();
-    let hlsl_dxil = recomp::dxc::compile(&hlsl.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let vals = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 64, (4 | 5 << 3 | 6 << 6 | 7 << 9) | 77 << 12]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 2;
+        r[10..14].copy_from_slice(&vals);
+    }
+    let fill = 0xDEAD_BEEFu32;
+    let r = runner::run(&dxil, &st, &vec![fill; 128]).expect("GPU run");
+    let mut want: Vec<u8> = std::iter::repeat_n(fill.to_le_bytes(), 128).flatten().collect();
+    want[0x102..0x112].copy_from_slice(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
+}
 
-    // Test 3 cases: (EXEC, s[2:3], s[8:9]) covering EXEC==0, partial EXEC, and full EXEC
-    let cases: [(u64, u64, u64); 3] = [
-        (0, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF),
-        (0x0F0F_0F0F_0F0F_0F0F, 0x00FF_00FF_00FF_00FF, 0x0555_0555_0555_0555),
-        (0xFFFF_FFFF_FFFF_FFFF, 0xAAAA_AAAA_AAAA_AAAA, 0xCCCC_CCCC_CCCC_CCCC),
-    ];
-    for (exec, m1, m2) in cases {
-        let mut st = KernelState::default();
-        st.sgpr[126] = exec as u32;
-        st.sgpr[127] = (exec >> 32) as u32;
-        st.sgpr[2] = m1 as u32;
-        st.sgpr[3] = (m1 >> 32) as u32;
-        st.sgpr[8] = m2 as u32;
-        st.sgpr[9] = (m2 >> 32) as u32;
-        st.sgpr[10] = 0x1234_5678;
-        st.scc = 1;
-        for lane in 0..64 {
-            st.vgpr[lane][1] = 100 + lane as u32;
-            st.vgpr[lane][2] = 0xDEAD_0000 | lane as u32;
+#[test]
+fn window_at_lowers_to_32bit_carry_without_int64() {
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+    let with_adds = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 2), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 0), ("SADDR", 2), ("OFFSET", 0xFFC)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 2), ("OFFSET", 0x1F_FFFC), ("SOFFSET", 4)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1), ("OFFEN", 1), ("OFFSET", 4)], None),
+    ]);
+    let dxil = translate(&with_adds, ko).expect("multi-window with adds translates");
+    super::validate::validate(&dxil).expect("validates without Int64Ops");
+    if let Ok(dis) = super::validate::disassemble(&dxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(!dis.contains("64-bit integers") && !body.contains("i64"), "window_at with adds must not emit i64:\n{dis}");
+        assert!(!dis.contains("binaryWithCarryOrBorrow"), "window_at should avoid uaddc struct overhead:\n{dis}");
+        assert!(body.contains("icmp ult i32"), "expected scalar 32-bit carry compare in DXIL:\n{dis}");
+        assert!(dis.contains("dx.op.binaryWithTwoOuts.i32"), "expected UMul in DXIL:\n{dis}");
+    }
+
+    let zero_off = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let dxil0 = translate(&zero_off, ko).expect("zero-offset multi-window translates");
+    super::validate::validate(&dxil0).expect("zero-offset validates");
+    if let Ok(dis0) = super::validate::disassemble(&dxil0) {
+        let body0 = dis0.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(!dis0.contains("64-bit integers") && !body0.contains("i64"), "zero-offset window_at must not emit i64:\n{dis0}");
+        assert!(!body0.contains("icmp ult"), "zero-offset window_at must not emit carry compare:\n{dis0}");
+    }
+}
+
+#[test]
+fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
+    use crate::gpu::recomp::{dxc, runner};
+    const V: u64 = 256;
+    let unclamped = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
+    let clamped = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None)]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&unclamped, ko).unwrap_or_else(|e| panic!("unclamped translation: {e}"));
+    let dxil_clamped = translate(&clamped, ko).unwrap_or_else(|e| panic!("clamped translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator (unclamped): {e}"));
+    super::validate::validate(&dxil_clamped).unwrap_or_else(|e| panic!("validator (clamped): {e}"));
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let dis = super::validate::disassemble(&dxil).unwrap();
+    assert_eq!(dis.matches("dx.op.dot4AddPacked.i32(i32 164,").count(), 2, "expected 2 Dot4AddU8Packed calls:\n{dis}");
+    let dis_clamped = super::validate::disassemble(&dxil_clamped).unwrap();
+    assert!(!dis_clamped.contains("dot4AddPacked"), "clamped dot8 should stay 64-bit saturating:\n{dis_clamped}");
+}
+
+#[test]
+fn raw_loads_in_root_windows_are_branchless() {
+    let loads = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 6), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 16), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+    ]);
+    for (wave64, split) in [(false, false), (true, true), (true, false)] {
+        let dxil = translate(&loads, KernelOptions { wave64, split, mem_windows: 4, sampler_base: 0 })
+            .unwrap_or_else(|e| panic!("wave64={wave64} split={split}: {e}"));
+        super::validate::validate(&dxil).expect("valid DXIL");
+        if let Ok(dis) = super::validate::disassemble(&dxil) {
+            let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+            assert!(dis.contains("@dx.op.rawBufferLoad"), "expected rawBufferLoad in DXIL:\n{dis}");
+            assert!(!body.contains("switch i32"), "multi-window root-UAV loads must not emit switch (wave64={wave64}, split={split}):\n{dis}");
         }
-        let ref_out = runner::run(&hlsl_dxil, &st, &[]).unwrap();
-        let got_out = runner::run(&dxil, &st, &[]).unwrap();
-        assert_eq!((got_out.sgpr[126], got_out.sgpr[127]), (ref_out.sgpr[126], ref_out.sgpr[127]), "exec mismatch for exec={exec:#x}");
-        assert_eq!(got_out.scc, ref_out.scc, "scc mismatch for exec={exec:#x}");
-        assert_eq!(got_out.sgpr[10], ref_out.sgpr[10], "s10 mismatch for exec={exec:#x}");
-        for lane in 0..64 {
-            assert_eq!(got_out.vgpr[lane][1], ref_out.vgpr[lane][1], "v1[{lane}] mismatch for exec={exec:#x}");
-            assert_eq!(got_out.vgpr[lane][2], ref_out.vgpr[lane][2], "v2[{lane}] mismatch for exec={exec:#x}");
+    }
+    let heap_dxil = translate(&loads, KernelOptions { wave64: false, split: false, mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+        .expect("heap windows translate");
+    super::validate::validate(&heap_dxil).expect("heap windows validate");
+
+    let writes = prog(&[
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 4), ("DATA", 5), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)], None),
+    ]);
+    let wdxil = translate(&writes, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }).expect("writes translate");
+    super::validate::validate(&wdxil).expect("writes validate");
+    if let Ok(dis) = super::validate::disassemble(&wdxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(body.contains("switch i32"), "stores and atomics must keep multi-window switch:\n{dis}");
+    }
+
+    let ps_code = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0), ("OFFSET", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = crate::gpu::recomp::PsInterface {
+        inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x2,
+        attrs: None,
+    };
+    let ps_k = super::kernel::translate_pixel(&ps_code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }, &psi)
+        .expect("pixel shader multi-window load translates");
+    super::validate::validate(&ps_k.dxil).expect("pixel shader validates");
+    if let Ok(dis) = super::validate::disassemble(&ps_k.dxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(body.contains("switch i32"), "pixel shader multi-window loads must keep switch:\n{dis}");
+    }
+}
+
+#[test]
+fn raw_loads_in_root_windows_respect_exec_and_bounds() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let code = prog(&[
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)], None),
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 129), ("VSRC1", 15)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_LOAD_DWORDX2", "ENC_FLAT_GLBL", &[("VDST", 22), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 24), ("VADDR", 10), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 25), ("VADDR", 10), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1), ("OFFSET", 2)], None),
+    ]);
+    let w32_dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }).expect("wave32 translates");
+    let split_dxil = translate(&code, KernelOptions { wave64: true, split: true, mem_windows: 4, sampler_base: 0 }).expect("split-wave64 translates");
+    let w64_dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 4, sampler_base: 0 }).expect("wave64 translates");
+    for dxil in [&w32_dxil, &split_dxil, &w64_dxil] {
+        super::validate::validate(dxil).expect("valid DXIL");
+    }
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no GPU");
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(4, 1 << 20).expect("4 UMA windows");
+    let ws: [u64; 4] = std::array::from_fn(|k| arena.window(k).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    // Non-zero canary at offset 0 of every window so leaked unselected reads fail immediately.
+    for (k, &wk) in ws.iter().enumerate() {
+        *word(wk) = 0xBAD0_0000 | k as u32;
+        *word(wk + 0x1000) = 0xA000_0000 | (k as u32 * 0x11);
+        *word(wk + 0x1004) = 0xB000_0000 | (k as u32 * 0x11);
+    }
+    *word(ws[1] + 8) = 0xCA44_0001;
+    *word(ws[1] + 12) = 0xCA44_0002;
+    *word(ws[2] + 0x1000) = 0x510A_D001;
+    *word(ws[2] + 0x1004) = 0x510A_D002;
+    for l in 0..64u64 {
+        *word(ws[3] + 0x2000 + 4 * l) = 0x3000_0000 | l as u32;
+        *word(ws[2] + 0x2000 + 4 * l) = ((0xF000 | (l as u32 + 1)) << 16) | 0xBEEF;
+    }
+    let hi = |a: u64| (a >> 32) as u32;
+    let ident = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[(ws[2] + 0x1000) as u32, hi(ws[2])]);
+    st.sgpr[12..16].copy_from_slice(&[(ws[3] + 0x2000) as u32, (hi(ws[3]) & 0xFFFF) | (4 << 16), 64, 0]);
+    st.sgpr[16..20].copy_from_slice(&[(ws[2] + 0x2000) as u32, (hi(ws[2]) & 0xFFFF) | (4 << 16), 64, ident | (11 << 12)]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let slot = l % 16;
+        let active = slot < 8;
+        r[15] = u32::from(active);
+        r[10] = if active { l as u32 } else { 0xFFFF_FFFF };
+        r[20] = 0x5EED_0000 | l as u32;
+        r[22] = 0x5EED_1000 | l as u32;
+        r[23] = 0x5EED_2000 | l as u32;
+        r[24] = 0x5EED_3000 | l as u32;
+        r[25] = 0x5EED_4000 | l as u32;
+        if !active {
+            r[2] = 0x7FFF_FFE0;
+            r[3] = 0xDEAD_0000;
+            r[4] = 0x7FFF_FFE0;
+            r[5] = 0xDEAD_0000;
+            continue;
+        }
+        // Dynamic window choices: 0, 1, 2, 3, w>=4, 0xFFFF_FFFF, hi==0 (-> w0), carry w0->w1.
+        match slot {
+            0..=3 => {
+                r[2] = (ws[slot] + 0x1000) as u32;
+                r[3] = hi(ws[slot]);
+                r[4] = (ws[slot] + 0xFF0) as u32;
+                r[5] = hi(ws[slot]);
+            }
+            4 => {
+                r[2] = 0x1000;
+                r[3] = hi(ws[0]) + 4;
+                r[4] = 0xFF0;
+                r[5] = hi(ws[0]) + 4;
+            }
+            5 => {
+                r[2] = 0x1000;
+                r[3] = 0xFFFF_FFFF;
+                r[4] = 0xFF0;
+                r[5] = 0xFFFF_FFFF;
+            }
+            6 => {
+                r[2] = 0x1000;
+                r[3] = 0;
+                r[4] = 0xFF0;
+                r[5] = 0;
+            }
+            7 => {
+                r[2] = 0x1000;
+                r[3] = hi(ws[0]);
+                // 0xFFFF_FFF8 + OFFSET 16 carries from window 0 into window 1 at byte offset 8.
+                r[4] = 0xFFFF_FFF8;
+                r[5] = hi(ws[0]);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let mut runs: Vec<(&str, &[u8], usize)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", &w32_dxil, 32));
+        runs.push(("split-wave64", &split_dxil, 64));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", &w64_dxil, 64));
+    }
+    for (label, dxil, lanes) in runs {
+        let r = runner::run_in_arena(dxil, &st, &arena).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!((r.sgpr[20], r.sgpr[21]), (0x510A_D001, 0x510A_D002), "{label}: s_load_dwordx2 from window 2");
+        for l in 0..lanes {
+            let slot = l % 16;
+            if slot >= 8 {
+                assert_eq!(r.vgpr[l][20], 0x5EED_0000 | l as u32, "{label} lane {l}: inactive global_load preserved v20");
+                assert_eq!(r.vgpr[l][22], 0x5EED_1000 | l as u32, "{label} lane {l}: inactive global_loadx2 preserved v22");
+                assert_eq!(r.vgpr[l][23], 0x5EED_2000 | l as u32, "{label} lane {l}: inactive global_loadx2 preserved v23");
+                assert_eq!(r.vgpr[l][24], 0x5EED_3000 | l as u32, "{label} lane {l}: inactive buffer_load preserved v24");
+                assert_eq!(r.vgpr[l][25], 0x5EED_4000 | l as u32, "{label} lane {l}: inactive buffer_load_format preserved v25");
+                continue;
+            }
+            let (want20, want22, want23) = match slot {
+                0..=3 => {
+                    let w = slot as u32;
+                    let w20 = if w == 2 { 0x510A_D001 } else { 0xA000_0000 | (w * 0x11) };
+                    let w22 = if w == 2 { 0x510A_D001 } else { 0xA000_0000 | (w * 0x11) };
+                    let w23 = if w == 2 { 0x510A_D002 } else { 0xB000_0000 | (w * 0x11) };
+                    (w20, w22, w23)
+                }
+                4 | 5 => (0, 0, 0),
+                6 => (0xA000_0000, 0xA000_0000, 0xB000_0000),
+                7 => (0xA000_0000, 0xCA44_0001, 0xCA44_0002),
+                _ => unreachable!(),
+            };
+            assert_eq!(r.vgpr[l][20], want20, "{label} lane {l} (slot {slot}): global_load_dword");
+            assert_eq!((r.vgpr[l][22], r.vgpr[l][23]), (want22, want23), "{label} lane {l} (slot {slot}): global_load_dwordx2");
+            assert_eq!(r.vgpr[l][24], 0x3000_0000 | l as u32, "{label} lane {l}: buffer_load_dword from window 3");
+            assert_eq!(r.vgpr[l][25], 0xF000 | (l as u32 + 1), "{label} lane {l}: buffer_load_format_x unaligned from window 2");
         }
     }
 }
@@ -804,7 +1246,7 @@ fn kernel_s_barrier_stays_a_group_sync() {
 
 /// With LDS the safe barrier's words are the top of the one 32 KB block (8189, 8190; the
 /// split form's lane counter keeps 8191, its exchange moves below): no second group-shared
-/// array past the D3D12 limit, and the program's accesses stop below them.
+/// array past the D3D12 limit, and the program's accesses are kept off them.
 #[test]
 fn safe_barrier_words_live_in_the_lds_block() {
     if !super::group_barrier::safe_barrier_enabled() {
@@ -821,7 +1263,7 @@ fn safe_barrier_words_live_in_the_lds_block() {
         let g = gs_globals(&dis);
         assert_eq!(g.len(), 1, "{at}: only the LDS block:\n{dis}");
         assert!(g[0].contains("[8192 x i32]"), "{at}:\n{dis}");
-        assert!(dis.contains("i32 8188"), "{at}: accesses clamped below the barrier words:\n{dis}");
+        assert!(dis.contains("i32 8188"), "{at}: accesses to the barrier words go below them:\n{dis}");
         assert!(dis.contains("i32 8189") && dis.contains("i32 8190"), "{at}:\n{dis}");
     }
     for threads in [[64, 1, 1], [128, 1, 1]] {
@@ -833,124 +1275,56 @@ fn safe_barrier_words_live_in_the_lds_block() {
     }
 }
 
-/// `s_setreg_b32 hwreg(HW_REG_MODE, 3, 1), s0` sets bit 3 of `MODE` (offset 3, dp_mask 2):
-/// lowering must not subtract `2 - off` before matching `dp_mask`, and the dynamic f16 rounding
-/// result must agree with HLSL on the GPU.
+/// Non-split form with the safe barrier: only words 8189 and 8190 are the barrier's, so the
+/// program's words 8188 and 8191 stay two words. After storing 11 and 22 to them and an
+/// `s_barrier`, every thread reads both back.
 #[test]
-fn s_setreg_b32_mode_bit3_does_not_underflow() {
-    use crate::gpu::recomp::{dxc, runner, Options};
-    // HW_REG_MODE (1), offset 3, size-1 = 0 -> 1 | (3 << 6) = 0x00C1
-    let code = prog(&[
-        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x00C1)], None),
-        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None),
-    ]);
-    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
-    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct DXIL failed: {e}"));
-    if runner::wave32_supported() != Ok(true) {
-        return runner::skip_test("no wave32");
+fn gpu_safe_barrier_keeps_lds_words_8188_and_8191_apart() {
+    use crate::gpu::recomp::runner;
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
     }
-    if dxc::location().is_err() {
+    const LIT: u64 = 255;
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", LIT)], Some(4 * 8188)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", LIT)], Some(4 * 8191)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 128 + 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128 + 22)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 3)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 4)], None),
+        S_BARRIER,
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 1), ("VDST", 5)], None),
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 2), ("VDST", 6)], None),
+        // global memory at s0 + tid * 8: the two words read
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 128 + 3), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 6), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+    ]);
+    if runner::adapter().is_err() {
+        return runner::skip_test("no GPU");
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
         return runner::skip_test("no DXC");
     }
-    let mut st = runner::KernelState::default();
-    st.sgpr[0] = 1; // MODE[3:2] = 0b10 (RTN, round toward -inf)
-    st.vgpr[0][1] = 0x3F80_0001; // +1.0 + 2^-23 -> 0x3C00
-    st.vgpr[1][1] = 0xBF80_0001; // -1.0 - 2^-23 -> 0xBC01
-    let direct = runner::run(&dxil, &st, &[]).unwrap();
-    let t = crate::gpu::recomp::translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
-    let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
-    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (hlsl.vgpr[0][0], hlsl.vgpr[1][0]));
-    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (0x3C00, 0xBC01));
-}
-
-/// Constant data after the program (`kernel::translate_entry_rodata`), as the HLSL kernel's
-/// `gpu_loads_read_the_constant_data_after_the_program`: `s_getpc_b64` plus the compiler's
-/// offset is its address, and `s_load` / `global_load` (with windows `s_buffer_load` too) read
-/// it from the module's table – with one window, two windows (switch) and heap windows, where
-/// window 0 holds other bytes at the table's offset. Any other address still reads the memory.
-#[test]
-fn gpu_direct_loads_read_the_constant_data_after_the_program() {
-    use super::kernel::{translate_entry_rodata, Entry};
-    use crate::gpu::recomp::{runner, HEAP_WINDOWS};
-    let body = |table: u32| {
-        prog(&[
-            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
-            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
-            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
-            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
-            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
-            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
-            // memory, not the data: v[12:13] and s[2:3]
-            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
-            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
-            // the V# s[4:7]
-            ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)], None),
-        ])
-    };
-    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
-    let block = body(0).len() as u32 + 4;
-    let code = body(block + 4);
-    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
-    let mut data = vec![table.len() as u32];
-    data.extend(&table);
-    data.push(0xBF81_0000);
-    let rodata = vec![(block, data)];
-    let split = runner::split_wave64();
-    let direct = |windows: u32, rodata: &[(u32, Vec<u32>)]| {
-        let o = KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 };
-        translate_entry_rodata(&code, o, Entry::Kernel, rodata).unwrap_or_else(|e| panic!("windows {windows:#x}: {}", &e[..e.len().min(800)]))
-    };
-    // (translations are validated in test builds)
-    let one = direct(1, &rodata).dxil;
-    assert_eq!(direct(1, &[]).dxil, translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap(), "no data, no table");
-    assert_ne!(one, direct(1, &[]).dxil);
-    match (runner::adapter(), runner::wave64_programs_supported()) {
-        (Ok(_), Ok(true)) => {}
-        (a, w) => return runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else { "no wave64" }),
-    }
-    let check = |r: &runner::KernelResult, buffer: [u32; 2], what: &str| {
-        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
-        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
-        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
-        assert_eq!(r.sgpr[30..32], buffer, "{what}: s_buffer_load");
-        for l in 0..64usize {
-            let k = l % 6;
-            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
-            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+    // two hardware waves each, so the safe barrier is used
+    let runs = [(false, 64u32, runner::wave32_supported(), "no wave32"), (true, 128, runner::wave64_supported(), "no wave64")];
+    for (wave64, threads, supported, skip) in runs {
+        if supported != Ok(true) {
+            runner::skip_test(skip);
+            continue;
         }
-    };
-    // one window: nothing of the code is in the memory (and a V# is always memory)
-    let mut st = runner::KernelState::default();
-    st.sgpr[2] = 0x900;
-    st.sgpr[4..7].copy_from_slice(&[0x900, 0, 64]);
-    for (l, r) in st.vgpr.iter_mut().enumerate() {
-        r[10] = 4 * (l as u32 % 6);
-        r[12] = 0x800 + 4 * l as u32;
-    }
-    let mut mem = vec![0u32; 1024];
-    mem[0x240..0x243].copy_from_slice(&[4242, 4343, 4444]);
-    for l in 0..64 {
-        mem[0x200 + l] = 7000 + l as u32;
-    }
-    check(&runner::run(&one, &st, &mem).unwrap(), [4343, 4444], "one window");
-    // several windows: a code address is in none of them, and window 0 holds other bytes at
-    // the table's offset; the V# is on the table
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
-    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
-    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
-    for k in 0..16u64 {
-        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
-    }
-    *word(w1 + 0x900) = 4242;
-    *word(w1 + 0x904) = 4343;
-    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
-    st.sgpr[4..7].copy_from_slice(&[block + 4, crate::gpu::recomp::CODE_ADDRESS_HI, 64]);
-    for (l, r) in st.vgpr.iter_mut().enumerate() {
-        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
-        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
-        r[13] = (w1 >> 32) as u32;
-    }
-    for (windows, what) in [(2, "two windows"), (2 | HEAP_WINDOWS, "heap windows")] {
-        check(&runner::run_in_arena(&direct(windows, &rodata).dxil, &st, &arena).unwrap(), [table[1], table[2]], what);
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let csi = crate::gpu::recomp::CsInterface { user_sgprs: 2, ..cs([threads, 1, 1]) };
+        let k = super::kernel::translate_compute(&code, o, &csi).unwrap_or_else(|e| panic!("wave64 {wave64}: {}", &e[..e.len().min(1500)]));
+        let base = 0x100usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        let mem = vec![0u32; base / 4 + 2 * threads as usize];
+        let out = runner::dispatch(&k.dxil, [1, 1, 1], &io, &mem).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+        for (tid, read) in out[base / 4..].chunks(2).enumerate() {
+            assert_eq!(read, [11, 22], "wave64 {wave64} thread {tid}: LDS words 8188 and 8191");
+        }
     }
 }

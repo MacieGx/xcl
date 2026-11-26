@@ -3,6 +3,7 @@
 //! `recomp/emit.rs` `smem` / `mubuf` / `flat` / `ds` / `export` and
 //! `PRELUDE_MEM`). Accesses of disabled lanes are real branches.
 
+use super::group_barrier::{SBarrier, LDS_BAR_AT};
 use super::lower::{err, Dst, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, RmwOp, Value};
 use super::ops::AtomicOp;
@@ -151,13 +152,13 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
-/// Windows a program with heap windows (`Lw::heap_mem`) may select: the descriptors
+/// Lab: windows a program with heap windows (`Lw::heap_mem`) may select: the descriptors
 /// `MEM_HEAP_BASE`.. hold the unified block's windows and, after them, the title's memory
-/// outside it (`recomp::HEAP_WINDOW_SLOTS`, `d3d12x::view_mem`) – the same bound as the HLSL
+/// outside it (`uma::MAX_HEAP_WINDOWS` slots, `d3d12x::view_mem`) – the same bound as the HLSL
 /// path's accessors (`recomp::emit::mem_accessors`). With the unified block's count alone a
 /// direct-translated compute program read 0 from a retail title's GPU view.
 pub(crate) fn heap_window_bound(mems: usize) -> u32 {
-    (mems as u32).max(crate::gpu::recomp::HEAP_WINDOW_SLOTS)
+    (mems as u32).max(crate::gpu::uma::MAX_HEAP_WINDOWS as u32)
 }
 
 impl Lw {
@@ -323,68 +324,35 @@ impl Lw {
         out
     }
 
-    pub(crate) fn with_mem_i32s(
-        &mut self,
-        guard: Option<Value>,
-        n: usize,
-        f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
-    ) -> Vec<Value> {
-        let i32 = self.s.m.i32();
-        let tys = vec![i32; n];
-        self.with_mem_many_tys(guard, &tys, f)
-    }
-
-    /// Read-only memory load on the active window. Under descriptor-heap windows
-    /// (`self.heap_mem`, `XCL_HEAP_WINDOWS=1`) or a single/constant window (`fixed_mem`),
-    /// executes branchlessly by clamping an inactive or out-of-range lane to window 0 and
-    /// zeroing the result with `select` (passing the active condition to `f` so callers
-    /// also clamp byte addresses to 0). Multi-window non-heap mode falls back to
-    /// [`Self::with_mem_many_tys`]. Never use this for stores or atomics.
-    pub(crate) fn with_mem_load_i32s(
+    /// Pure read-only raw buffer loads across the active memory window (`loads` is a slice of
+    /// `(aligned_byte_offset, component_mask)` pairs). For non-graphics stages with root UAV
+    /// windows (`self.heap_mem.is_none() && self.gfx.is_none()`), emits branchless straight-line
+    /// loads reading offset `0` on unselected windows / inactive lanes and merging with `select`,
+    /// eliminating per-load `switch` / guard CFGs and `phi` nodes while preserving `#1693`
+    /// semantics (out-of-range windows and inactive lanes yield `0`). Graphics stages (`VS`/`PS`)
+    /// keep the `switch` form so non-coherent root UAV loads are not serialized in one basic block.
+    pub(crate) fn with_mem_raw_loads(
         &mut self,
         mut guard: Option<Value>,
-        n: usize,
-        f: &mut dyn FnMut(&mut Lw, RawUav, Option<Value>) -> Vec<Value>,
+        loads: &[(Value, u8)],
     ) -> Vec<Value> {
+        let total: usize = loads.iter().map(|&(_, mask)| mask.count_ones() as usize).sum();
+        let z = self.c(0);
         if let Some(c) = guard {
             match self.s.m.const_u64(c) {
                 Some(1) => guard = None,
-                Some(0) => return vec![self.c(0); n],
+                Some(0) => return vec![z; total],
                 _ => {}
             }
         }
-        if let Some(coherent) = self.heap_mem {
-            let windows = heap_window_bound(self.mems.len());
-            let w = self.rd(super::lower::VAR_WIN);
-            let inside = self.cmpc(Pred::ULt, w, windows);
-            let cond = match guard {
-                Some(g) => self.and(g, inside),
-                None => inside,
-            };
-            if self.s.m.const_u64(cond) == Some(0) {
-                return vec![self.c(0); n];
-            }
-            let cond_opt = (self.s.m.const_u64(cond) != Some(1)).then_some(cond);
-            // Clamp the heap window using `inside` alone (independent of lane `guard`) so
-            // consecutive loads in the same window share one CSE'd `createHandleFromHeap`
-            // + `annotateHandle` even when `EXEC` changes between loads.
-            let w_safe = if self.s.m.const_u64(inside) == Some(1) {
-                w
-            } else {
-                let z = self.c(0);
-                self.sel(inside, w, z)
-            };
-            let i = self.addc(w_safe, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = self.s.heap_raw_buffer_uav(i, coherent);
-            let vals = f(self, m, cond_opt);
-            debug_assert_eq!(vals.len(), n);
-            return match cond_opt {
-                Some(c) => {
-                    let z = self.c(0);
-                    vals.into_iter().map(|v| self.sel(c, v, z)).collect()
+        if self.heap_mem.is_some() || self.gfx.is_some() {
+            return self.with_mem_i32s(guard, total, &mut |lw, m| {
+                let mut out = Vec::with_capacity(total);
+                for &(a, mask) in loads {
+                    out.extend(lw.s.raw_load(m, a, mask));
                 }
-                None => vals,
-            };
+                out
+            });
         }
         let fixed_mem = if self.mems.len() <= 1 {
             Some(self.mems[0])
@@ -394,36 +362,64 @@ impl Lw {
                 if (k as usize) < self.mems.len() {
                     Some(self.mems[k as usize])
                 } else {
-                    return vec![self.c(0); n];
+                    return vec![z; total];
                 }
             } else {
                 None
             }
         };
         if let Some(m) = fixed_mem {
-            let vals = f(self, m, guard);
-            debug_assert_eq!(vals.len(), n);
-            return match guard {
-                Some(c) => {
-                    let z = self.c(0);
-                    vals.into_iter().map(|v| self.sel(c, v, z)).collect()
+            let mut out = Vec::with_capacity(total);
+            if let Some(cond) = guard {
+                for &(a, mask) in loads {
+                    let at = self.sel(cond, a, z);
+                    for v in self.s.raw_load(m, at, mask) {
+                        out.push(self.sel(cond, v, z));
+                    }
                 }
-                None => vals,
-            };
+            } else {
+                for &(a, mask) in loads {
+                    out.extend(self.s.raw_load(m, a, mask));
+                }
+            }
+            return out;
         }
-        let i32 = self.s.m.i32();
-        let tys = vec![i32; n];
-        self.with_mem_many_tys(guard, &tys, &mut |lw, m| f(lw, m, None))
+        let w = self.rd(super::lower::VAR_WIN);
+        let mems = self.mems.clone();
+        let n = mems.len();
+        let w_eff = if let Some(cond) = guard {
+            let skip = self.c(n as u32);
+            self.sel(cond, w, skip)
+        } else {
+            w
+        };
+        let sels: Vec<Value> = (0..n).map(|k| self.cmpc(Pred::Eq, w_eff, k as u32)).collect();
+        let mut out = Vec::with_capacity(total);
+        for &(a, mask) in loads {
+            let count = mask.count_ones() as usize;
+            let mut acc = vec![z; count];
+            for (k, &m) in mems.iter().enumerate() {
+                let sel_k = sels[k];
+                let at = self.sel(sel_k, a, z);
+                let vals = self.s.raw_load(m, at, mask);
+                for (dst, v) in acc.iter_mut().zip(vals) {
+                    *dst = self.sel(sel_k, v, *dst);
+                }
+            }
+            out.extend(acc);
+        }
+        out
     }
 
-    fn safe_load_addr(&mut self, a: Value, cond: Option<Value>) -> Value {
-        match cond {
-            Some(c) => {
-                let z = self.c(0);
-                self.sel(c, a, z)
-            }
-            None => a,
-        }
+    pub(crate) fn with_mem_i32s(
+        &mut self,
+        guard: Option<Value>,
+        n: usize,
+        f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
+    ) -> Vec<Value> {
+        let i32 = self.s.m.i32();
+        let tys = vec![i32; n];
+        self.with_mem_many_tys(guard, &tys, f)
     }
 
     pub(crate) fn with_mem_void(
@@ -447,20 +443,26 @@ impl Lw {
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {
         let a = self.andc(a, !3);
-        self.with_mem_load_i32s(None, 1, &mut |lw, m, cond| {
-            let a = lw.safe_load_addr(a, cond);
-            lw.s.raw_load(m, a, 1)
-        })[0]
+        self.with_mem_raw_loads(None, &[(a, 1)])[0]
     }
-    /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords in one window switch).
+    /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords across root or heap memory windows).
     pub(crate) fn mem_ld_n(&mut self, guard: Option<Value>, a: Value, count: u32) -> Vec<Value> {
         debug_assert!((1..=4).contains(&count));
         let a = self.andc(a, !3);
         let mask = ((1u32 << count) - 1) as u8;
-        self.with_mem_load_i32s(guard, count as usize, &mut |lw, m, cond| {
-            let a = lw.safe_load_addr(a, cond);
-            lw.s.raw_load(m, a, mask)
-        })
+        self.with_mem_raw_loads(guard, &[(a, mask)])
+    }
+    fn mem_ld_chunks(&mut self, base_aligned: Value, count: u32) -> Vec<Value> {
+        let mut loads = Vec::new();
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(4);
+            let at = self.addc(base_aligned, 4 * done);
+            let mask = ((1u32 << chunk) - 1) as u8;
+            loads.push((at, mask));
+            done += chunk;
+        }
+        self.with_mem_raw_loads(None, &loads)
     }
     /// `mem.Store(a & ~3, v)`
     pub fn mem_st(&mut self, a: Value, v: Value) {
@@ -475,19 +477,13 @@ impl Lw {
     }
 
     /// `ld_raw`: four dwords from an unaligned byte address (one Load4 + one Load1
-    /// in a single window switch, optionally combined with a lane guard).
+    /// across memory windows, optionally combined with a lane guard).
     fn ld_raw_guarded(&mut self, guard: Option<Value>, a: Value) -> [Value; 4] {
         let b = self.andc(a, !3);
         let b16 = self.addc(b, 16);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_load_i32s(guard, 5, &mut |lw, m, cond| {
-            let b = lw.safe_load_addr(b, cond);
-            let b16 = lw.safe_load_addr(b16, cond);
-            let mut v = lw.s.raw_load(m, b, 0xF);
-            v.push(lw.s.raw_load(m, b16, 1)[0]);
-            v
-        });
+        let w = self.with_mem_raw_loads(guard, &[(b, 0xF), (b16, 1)]);
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -502,15 +498,12 @@ impl Lw {
         r
     }
 
-    /// One unaligned dword from byte address `a` (one Load2 in a single window switch).
+    /// One unaligned dword from byte address `a` (one Load2 across memory windows).
     fn ld_raw_u32_guarded(&mut self, guard: Option<Value>, a: Value) -> Value {
         let b = self.andc(a, !3);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_load_i32s(guard, 2, &mut |lw, m, cond| {
-            let b = lw.safe_load_addr(b, cond);
-            lw.s.raw_load(m, b, 0x3)
-        });
+        let w = self.with_mem_raw_loads(guard, &[(b, 0x3)]);
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -551,37 +544,44 @@ impl Lw {
         })?;
         let part = self.lnot(whole);
         self.guarded(part, &mut |lw| {
-            let big = lw.cmpc(Pred::UGe, n, 4);
-            let n8 = lw.shlc(n, 3);
-            let n8 = lw.andc(n8, 31);
+            // dword k of `r` holds bytes 4k..min(4k + 4, n); each lands at b + 4k with shift s
+            // and spills into the next dword when s + its bit width passes 32
             let one = lw.c(1);
-            let m = lw.bin(BinOp::Shl, one, n8);
-            let m = lw.sub(m, one);
             let all = lw.c(u32::MAX);
-            let m = lw.sel(big, all, m);
-            let ms = lw.bin(BinOp::Shl, m, s);
-            let vs = lw.bin(BinOp::Shl, r[0], s);
-            lw.st_part(b, ms, vs);
+            let k4 = lw.c(4);
+            let k32 = lw.c(32);
             let snz = lw.cmpc(Pred::Ne, s, 0);
-            let top = lw.add(s, n8);
-            // s + 8n with n = 4 gives s + 32 (n8 above is masked to 31)
-            let is4 = lw.cmpc(Pred::UGe, n, 4);
-            let k = lw.c(32);
-            let z = lw.c(0);
-            let t = lw.sel(is4, k, z);
-            let top = lw.add(top, t);
-            let over = lw.cmpc(Pred::UGt, top, 32);
-            let spill = lw.land(snz, over);
-            lw.guarded(spill, &mut |lw| {
-                let b4 = lw.addc(b, 4);
-                let k32 = lw.c(32);
-                let inv = lw.sub(k32, s);
-                let inv = lw.andc(inv, 31);
-                let m2 = lw.bin(BinOp::LShr, m, inv);
-                let v2 = lw.bin(BinOp::LShr, r[0], inv);
-                lw.st_part(b4, m2, v2);
-                Ok(())
-            })
+            let inv = lw.sub(k32, s);
+            let inv = lw.andc(inv, 31);
+            for k in 0..4u32 {
+                let has = lw.cmpc(Pred::UGt, n, k * 4);
+                let rk = r[k as usize];
+                lw.guarded(has, &mut |lw| {
+                    let rem = lw.addc(n, (k * 4).wrapping_neg());
+                    let big = lw.cmpc(Pred::UGe, rem, 4);
+                    let chunk = lw.sel(big, k4, rem);
+                    let c8 = lw.shlc(chunk, 3);
+                    let c8m = lw.andc(c8, 31);
+                    let m = lw.bin(BinOp::Shl, one, c8m);
+                    let m = lw.sub(m, one);
+                    let m = lw.sel(big, all, m);
+                    let at = lw.addc(b, 4 * k);
+                    let ms = lw.bin(BinOp::Shl, m, s);
+                    let vs = lw.bin(BinOp::Shl, rk, s);
+                    lw.st_part(at, ms, vs);
+                    let top = lw.add(s, c8);
+                    let over = lw.cmpc(Pred::UGt, top, 32);
+                    let spill = lw.land(snz, over);
+                    lw.guarded(spill, &mut |lw| {
+                        let at4 = lw.addc(at, 4);
+                        let m2 = lw.bin(BinOp::LShr, m, inv);
+                        let v2 = lw.bin(BinOp::LShr, rk, inv);
+                        lw.st_part(at4, m2, v2);
+                        Ok(())
+                    })
+                })?;
+            }
+            Ok(())
         })
     }
 
@@ -1023,8 +1023,15 @@ impl Lw {
         let e1 = self.ftosi(s1);
         let e2 = self.ftoui(f);
         let e3 = self.ftosi(f);
-        // floats
-        let h = self.s.f32_to_f16(f);
+        // ty 4/5: saturate UINT to [0, mu] and SINT to [!ms, ms] when w < 32
+        let u4 = self.umin(x, mu);
+        let e4 = self.sel(big, x, u4);
+        let lo = self.not(ms);
+        let s5 = self.imax(x, lo);
+        let s5 = self.imin(s5, ms);
+        let e5 = self.sel(big, x, s5);
+        // floats (RTZ matches RDNA2 / HLSL fmt_encode so finite > 65504 saturates to max finite)
+        let h = self.f16_rtz(f);
         let w11 = self.cmpc(Pred::Eq, w, 11);
         let k3f0 = self.c(0x3F0);
         let nanv = self.selc(w11, 0x7E0, k3f0);
@@ -1038,14 +1045,10 @@ impl Lw {
         let small = self.sel(n, nanv, small);
         let w16 = self.cmpc(Pred::Eq, w, 16);
         let fl = self.sel(w16, h, small);
-        let t4 = self.cmpc(Pred::Eq, ty, 4);
-        let t5 = self.cmpc(Pred::Eq, ty, 5);
         let w32 = self.cmpc(Pred::Eq, w, 32);
-        let raw = self.lor(t4, t5);
-        let raw = self.lor(raw, w32);
-        let r = self.sel(raw, x, fl);
+        let r = self.sel(w32, x, fl);
         let mut res = r;
-        for (k, val) in [(3u32, e3), (2, e2), (1, e1), (0, e0)] {
+        for (k, val) in [(5u32, e5), (4, e4), (3, e3), (2, e2), (1, e1), (0, e0)] {
             let is = self.cmpc(Pred::Eq, ty, k);
             res = self.sel(is, val, res);
         }
@@ -1173,23 +1176,14 @@ impl Lw {
             let lim = self.sel(sz, d2, lim);
             let base = self.add(d0, off);
             let base_aligned = self.andc(base, !3);
-            let raw = self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
-                let base_aligned = lw.safe_load_addr(base_aligned, cond);
-                let mut out = Vec::with_capacity(count as usize);
-                let mut done = 0u32;
-                while done < count {
-                    let chunk = (count - done).min(4);
-                    let at = lw.addc(base_aligned, 4 * done);
-                    let at = lw.safe_load_addr(at, cond);
-                    let mask = ((1u32 << chunk) - 1) as u8;
-                    out.extend(lw.s.raw_load(m, at, mask));
-                    done += chunk;
-                }
-                out
-            });
-            // (a V# on the constant data in the code: only with windows, where its high
-            // dword tells it from the title's memory)
-            let raw = if self.windowed() { self.rodata_loads(base_aligned, raw) } else { raw };
+            let raw = self.mem_ld_chunks(base_aligned, count);
+            // (a V# on the constant data in the code)
+            let raw = if self.code_loads.contains_key(&d.pc) {
+                let hi = self.andc(d1, 0xFFFF);
+                self.rodata_loads(d.pc, hi, base_aligned, raw)
+            } else {
+                raw
+            };
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1199,6 +1193,15 @@ impl Lw {
                 })
                 .collect::<Vec<_>>()
         } else {
+            // a repeat of a load nothing has changed since: its values (`reload`)
+            let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
+            if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
+                for i in 0..count {
+                    let v = self.rd(var + i);
+                    self.write32(&Dst::S(sdata + i as u64), v);
+                }
+                return Ok(());
+            }
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
@@ -1207,22 +1210,9 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            let raw = self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
-                let base_aligned = lw.safe_load_addr(base_aligned, cond);
-                let mut out = Vec::with_capacity(count as usize);
-                let mut done = 0u32;
-                while done < count {
-                    let chunk = (count - done).min(4);
-                    let at = lw.addc(base_aligned, 4 * done);
-                    let at = lw.safe_load_addr(at, cond);
-                    let mask = ((1u32 << chunk) - 1) as u8;
-                    out.extend(lw.s.raw_load(m, at, mask));
-                    done += chunk;
-                }
-                out
-            });
+            let raw = self.mem_ld_chunks(base_aligned, count);
             // (constant data in the code)
-            self.rodata_loads(base_aligned, raw)
+            self.rodata_loads(d.pc, hi, base_aligned, raw)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1231,6 +1221,12 @@ impl Lw {
             let up = self.upper;
             for (v, o) in vals.iter_mut().zip(other) {
                 *v = self.sel(up, o, *v);
+            }
+        }
+        // (only an `s_load_dword*` without GLC / DLC has a slot)
+        if let Some(r) = self.reload {
+            for (i, &v) in vals.iter().enumerate() {
+                self.wr(super::reload::VAR_RELOAD + 16 * r.slot + i as u32, v);
             }
         }
         for (i, v) in vals.into_iter().enumerate() {
@@ -1375,10 +1371,7 @@ impl Lw {
                     let ea3 = self.andc(ea, 3);
                     let ea3_8 = self.shlc(ea3, 3);
                     let s = self.or(ea3_8, c1.off_bits);
-                    let w = self.with_mem_load_i32s(Some(act), 2, &mut |lw, m, cond| {
-                        let eb = lw.safe_load_addr(eb, cond);
-                        lw.s.raw_load(m, eb, 0x3)
-                    });
+                    let w = self.with_mem_raw_loads(Some(act), &[(eb, 0x3)]);
                     let lo = self.bin(BinOp::LShr, w[0], s);
                     let k32 = self.c(32);
                     let inv = self.sub(k32, s);
@@ -1581,7 +1574,8 @@ impl Lw {
             "umax" | "max_u32" => direct(self, AtomicOp::UMax, RmwOp::UMax, v),
             "smin" | "min_i32" => direct(self, AtomicOp::IMin, RmwOp::Min, v),
             "smax" | "max_i32" => direct(self, AtomicOp::IMax, RmwOp::Max, v),
-            "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => self.cmpxchg(at, v2, v),
+            "cmpswap" | "cmpst_b32" => self.cmpxchg(at, v2, v),
+            "fcmpswap" | "cmpst_f32" => self.fcas32(at, v2, v),
             "fmin" | "fmax" | "min_f32" | "max_f32" => {
                 let min = op == "fmin" || op == "min_f32";
                 match at {
@@ -1673,6 +1667,111 @@ impl Lw {
         p
     }
 
+    /// Bitwise IEEE-754 f32 ordered equality: `-0.0 == +0.0`, `NaN != NaN` (denormals kept).
+    pub(super) fn feq_bits32(&mut self, a: Value, b: Value) -> Value {
+        let abs_a = self.andc(a, 0x7FFF_FFFF);
+        let not_nan = self.cmpc(Pred::ULe, abs_a, 0x7F80_0000);
+        let same = self.cmp(Pred::Eq, a, b);
+        let both = self.or(a, b);
+        let mag = self.andc(both, 0x7FFF_FFFF);
+        let both_zero = self.cmpc(Pred::Eq, mag, 0);
+        let eq = self.lor(same, both_zero);
+        self.land(not_nan, eq)
+    }
+
+    /// Bitwise IEEE-754 f64 ordered equality in pure i64 ops (no DoubleExtensions needed).
+    pub(super) fn feq_bits64(&mut self, a: Value, b: Value) -> Value {
+        let mask = self.c64(0x7FFF_FFFF_FFFF_FFFF);
+        let inf = self.c64(0x7FF0_0000_0000_0000);
+        let z = self.c64(0);
+        let abs_a = self.and(a, mask);
+        let not_nan = self.cmp(Pred::ULe, abs_a, inf);
+        let same = self.cmp(Pred::Eq, a, b);
+        let both = self.or(a, b);
+        let mag = self.and(both, mask);
+        let both_zero = self.cmp(Pred::Eq, mag, z);
+        let eq = self.lor(same, both_zero);
+        self.land(not_nan, eq)
+    }
+
+    /// IEEE-754 32-bit float compare-exchange loop (at most 4096 rounds); returns the old value.
+    fn fcas32(&mut self, at: At, cmp: Value, new: Value) -> Value {
+        let z = self.c(0);
+        let init = match at {
+            At::Mem(a) => self.mraw_atomic(AtomicOp::Or, a, z),
+            At::Lds(i) => {
+                let g = self.lds.expect("lds");
+                self.s.gs_atomic(RmwOp::Or, g, i, z)
+            }
+        };
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i32);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits32(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.cmpxchg(at, c, new);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i32);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
+    }
+
+    /// IEEE-754 64-bit float compare-exchange loop (at most 4096 rounds); returns the old value.
+    fn fcas64(&mut self, a: Value, cmp: Value, new: Value) -> Value {
+        let z64 = self.c64(0);
+        let init = self.mraw_atomic(AtomicOp::Or, a, z64);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i64t = self.i64();
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i64t);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        let z = self.c(0);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits64(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.mraw_cmpxchg(a, c, new);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i64t);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
+    }
+
     /// Float min / max on `mem` as one integer atomic (the recompiler's `float_minmax_mem`).
     fn float_minmax_mem(&mut self, min: bool, a: Value, v: Value) -> LResult<Value> {
         let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };
@@ -1724,7 +1823,8 @@ impl Lw {
                 "umax" => lw.mraw_atomic(AtomicOp::UMax, a, v),
                 "smin" => lw.mraw_atomic(AtomicOp::IMin, a, v),
                 "smax" => lw.mraw_atomic(AtomicOp::IMax, a, v),
-                "cmpswap" | "fcmpswap" => lw.mraw_cmpxchg(a, cv, v),
+                "cmpswap" => lw.mraw_cmpxchg(a, cv, v),
+                "fcmpswap" => lw.fcas64(a, cv, v),
                 "fmin" | "fmax" => {
                     let min = ops == "fmin";
                     let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };
@@ -1945,11 +2045,12 @@ impl Lw {
             let vd = Self::fv(d, "VDST");
             let loaded = self.mem_ld_n(Some(act), a, count as u32);
             // (constant data in the code)
-            let loaded = if self.rodata.is_empty() {
+            let loaded = if !self.code_loads.contains_key(&d.pc) {
                 loaded
             } else {
+                let hi = self.flat_hi(d, op.ends_with("_addtid"));
                 let a = self.andc(a, !3);
-                self.rodata_loads(a, loaded)
+                self.rodata_loads(d.pc, hi, a, loaded)
             };
             for i in 0..count {
                 self.write32(&Dst::V(vd + i), loaded[i as usize]);
@@ -1993,14 +2094,22 @@ impl Lw {
 
     // ------------------------------------------------------------ LDS / DS
 
-    /// LDS dword index of byte address `at` (`(at >> 2) & 8191`, below the exchange words
-    /// in the split form and the safe barrier's words).
+    /// LDS dword index of byte address `at` (`(at >> 2) & 8191`), kept off the words the
+    /// translator uses itself. Split form: clamped below the exchange words (the safe
+    /// barrier's are above them). Otherwise, with the safe barrier, only its two words are
+    /// taken: an access to one of them goes to the word below, and every other word, 8191
+    /// included, stays the program's own.
     fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 8191);
-        if self.lds_top < 8191 {
+        if self.split {
             let k = self.c(self.lds_top);
             self.umin(i, k)
+        } else if self.sbar == SBarrier::Safe {
+            let past = self.addc(i, 0u32.wrapping_sub(LDS_BAR_AT));
+            let taken = self.cmpc(Pred::ULt, past, 2);
+            let below = self.c(LDS_BAR_AT - 1);
+            self.sel(taken, below, i)
         } else {
             i
         }

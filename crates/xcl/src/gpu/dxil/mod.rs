@@ -13,6 +13,7 @@
 
 pub mod bitstream;
 pub mod cfg;
+mod compact;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
@@ -22,7 +23,7 @@ mod lanes;
 pub mod lower;
 mod lower_geom;
 mod lower_gfx;
-mod lower_image;
+pub(crate) mod lower_image;
 mod lower_mem;
 mod lower_round;
 mod lower_valu;
@@ -32,10 +33,13 @@ pub mod module;
 pub mod ops;
 pub mod ops_core;
 mod prelude;
+pub mod reload;
 pub mod shader;
 pub mod ssa;
 pub mod validate;
 
+#[cfg(test)]
+mod compact_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]

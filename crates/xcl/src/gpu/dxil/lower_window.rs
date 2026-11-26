@@ -3,7 +3,7 @@
 //! `xcl_m*` accessors with `Options::heap_windows` (`recomp::emit::mem_accessors`).
 
 use super::lower::{Lw, VAR_WIN};
-use super::module::{Pred, Value};
+use super::module::{CastOp, Pred, Value};
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -59,30 +59,89 @@ impl Lw {
         if !self.windowed() {
             return;
         }
-        // `XCL_WINDOW_NO_CARRY=1` (xcl-dev/xcl pull request 2496): the window of the base address.
-        // Allocations do not straddle windows, so an access inside the allocation its base points
-        // into never carries or borrows into the high dword. Accesses off one base then share
-        // their window, its range check and its heap handle: less code in the driver for big
-        // compute programs (NVIDIA's shader code heap is limited, issue 2403).
-        if self.no_carry {
+        // `XCL_WINDOW_NO_CARRY=1`: the window of the base address (`no_carry`). Heap windows only:
+        // their views are bounds-checked, so an access that leaves its allocation and wraps inside
+        // the base's window reads 0 past the window's end; a root UAV has no bounds and such an
+        // access could hang the GPU (a window test did on an RTX 3090, #2496)
+        if no_carry() && self.heap_mem.is_some() {
             self.window_hi(hi, write);
             return;
         }
-        let mut ea = self.pack64(lo, hi);
-        for &t in adds {
-            let x = match t {
-                Ea::U(v) => self.zext64(v),
-                Ea::K(k) => self.c64(k as u64),
-                Ea::S(v) => self.sext64(v),
-                Ea::Mul(a, b) => {
-                    let (a, b) = (self.zext64(a), self.zext64(b));
-                    self.mul(a, b)
+        let non_zero = |t: &Ea| match *t {
+            Ea::K(0) => false,
+            Ea::U(v) | Ea::S(v) => self.s.m.const_u64(v) != Some(0),
+            Ea::Mul(a, b) => self.s.m.const_u64(a) != Some(0) && self.s.m.const_u64(b) != Some(0),
+            Ea::K(_) => true,
+        };
+        let terms: Vec<Ea> = adds.iter().copied().filter(non_zero).collect();
+        let (mut lo, mut hi) = (lo, hi);
+        let uadd = |lw: &mut Self, lo: &mut Value, hi: &mut Value, add_lo: Value, add_hi: Option<Value>| {
+            if let Some(ah) = add_hi {
+                *hi = lw.add(*hi, ah);
+            }
+            if lw.s.m.const_u64(*lo) == Some(0) {
+                *lo = add_lo;
+            } else {
+                let sum = lw.add(*lo, add_lo);
+                let carry = lw.cmp(Pred::ULt, sum, *lo);
+                *lo = sum;
+                let i32 = lw.s.m.i32();
+                let c32 = lw.s.m.cast(CastOp::ZExt, carry, i32);
+                *hi = lw.add(*hi, c32);
+            }
+        };
+        for (idx, t) in terms.iter().copied().enumerate() {
+            let has_more = idx + 1 < terms.len();
+            match t {
+                Ea::K(k) => {
+                    let kv = self.c(k);
+                    uadd(self, &mut lo, &mut hi, kv, None);
                 }
-            };
-            ea = self.add(ea, x);
+                Ea::U(v) => uadd(self, &mut lo, &mut hi, v, None),
+                Ea::S(v) => match self.s.m.const_u64(v) {
+                    Some(k) if (k as i32) < 0 => {
+                        let neg_k = (k as u32).wrapping_neg();
+                        if self.s.m.const_u64(lo) == Some(0) {
+                            lo = v;
+                            hi = self.addc(hi, u32::MAX);
+                        } else {
+                            let borrow = self.cmpc(Pred::ULt, lo, neg_k);
+                            if has_more {
+                                lo = self.add(lo, v);
+                            }
+                            let i32 = self.s.m.i32();
+                            let b32 = self.s.m.cast(CastOp::ZExt, borrow, i32);
+                            hi = self.sub(hi, b32);
+                        }
+                    }
+                    Some(_) => uadd(self, &mut lo, &mut hi, v, None),
+                    None => {
+                        let sign = self.ashrc(v, 31);
+                        uadd(self, &mut lo, &mut hi, v, Some(sign));
+                    }
+                },
+                Ea::Mul(a, b) => match (self.s.m.const_u64(a), self.s.m.const_u64(b)) {
+                    (Some(1), _) => uadd(self, &mut lo, &mut hi, b, None),
+                    (_, Some(1)) => uadd(self, &mut lo, &mut hi, a, None),
+                    (Some(ka), Some(kb)) => {
+                        let prod = (ka as u32 as u64) * (kb as u32 as u64);
+                        let (plo, phi) = (prod as u32, (prod >> 32) as u32);
+                        if phi != 0 {
+                            hi = self.addc(hi, phi);
+                        }
+                        if plo != 0 {
+                            let plov = self.c(plo);
+                            uadd(self, &mut lo, &mut hi, plov, None);
+                        }
+                    }
+                    _ => {
+                        let (phi, plo) = self.s.umul_wide(a, b);
+                        uadd(self, &mut lo, &mut hi, plo, Some(phi));
+                    }
+                },
+            }
         }
-        let (_, h) = self.unpack64(ea);
-        self.window_hi(h, write);
+        self.window_hi(hi, write);
     }
 
     /// `window_at` of a high dword already computed (`window_read` / `window_write`).
@@ -100,17 +159,22 @@ impl Lw {
         self.wr(VAR_WIN, w);
     }
 
-    /// `Lw::rodata` (the HLSL kernel's `xcl_gload`): the dwords `vals` a load read from memory
-    /// at `a`, `a + 4`.. (`a` dword-aligned), with those at a code address inside one of the
-    /// program's constant data blocks replaced by the block's dword. A code address has the
-    /// high dword `CODE_ADDRESS_HI` with several windows (`s_getpc_b64`; the window of the
-    /// access was just selected: `VAR_WIN`) and is the program's offset with one. `vals` as
-    /// they are without data.
-    pub(crate) fn rodata_loads(&mut self, a: Value, vals: Vec<Value>) -> Vec<Value> {
+    /// `Lw::rodata` (the HLSL kernel's `xcl_cload` / `xcl_gload`): the dwords `vals` the load
+    /// at `pc` read from memory at `a`, `a + 4`.. (`a` dword-aligned), with those at a code
+    /// address inside one of the program's constant data blocks replaced by the block's dword
+    /// (`Lw::code_loads`). A load whose address comes from `s_getpc_b64` on every path takes
+    /// the block's dwords (0 outside the blocks); one whose address may come from it tells a
+    /// code address by the high dword `CODE_ADDRESS_HI`: with several windows by the window of
+    /// the access, just selected (`VAR_WIN`), with one by `hi`, the raw high dword of the
+    /// address (the memory at the same low dword is read otherwise). `vals` as they are for the
+    /// other loads and without data.
+    pub(crate) fn rodata_loads(&mut self, pc: u64, hi: Value, a: Value, vals: Vec<Value>) -> Vec<Value> {
         let total: usize = self.rodata.iter().map(|b| b.1.len()).sum();
+        let Some(&kind) = self.code_loads.get(&pc) else { return vals };
         if total == 0 {
             return vals;
         }
+        let only_code = kind == crate::gpu::recomp::code_loads::CodeLoad::Code;
         let table = match self.rodata_table {
             Some(g) => g,
             None => {
@@ -124,14 +188,16 @@ impl Lw {
                 g
             }
         };
-        let code = if self.windowed() {
+        let code = if only_code {
+            None
+        } else if self.windowed() {
             let w = self.rd(VAR_WIN);
             let base = self.uma_base();
             let hi = self.c(crate::gpu::recomp::CODE_ADDRESS_HI);
             let cw = self.sub(hi, base);
             Some(self.cmp(Pred::Eq, w, cw))
         } else {
-            None
+            Some(self.cmpc(Pred::Eq, hi, crate::gpu::recomp::CODE_ADDRESS_HI))
         };
         // per block: `a`'s offset in it, its dword's index in the table, the block's bytes
         let mut first = 0u32;
@@ -165,7 +231,7 @@ impl Lw {
                 }
                 let p = self.s.m.gep(table, &[z, idx]);
                 let t = self.s.m.load(p, 4);
-                self.sel(inside, t, v)
+                self.sel(inside, t, if only_code { z } else { v })
             })
             .collect()
     }
@@ -176,6 +242,20 @@ impl Lw {
         if self.windowed() {
             let hi = self.andc(d1, 0xFFFF);
             self.window_at(hi, d0, adds, write);
+        }
+    }
+
+    /// The raw high dword of a FLAT / global access's address (`flat_window`, `addtid_window`):
+    /// SADDR's, the VGPR pair's or 0.
+    pub fn flat_hi(&mut self, d: &Decoded, addtid: bool) -> Value {
+        let global = d.enc.name == "ENC_FLAT_GLBL";
+        let saddr = Self::fv(d, "SADDR");
+        if (addtid || global) && saddr != 0x7D && saddr != 0x7F {
+            self.sreg(saddr + 1)
+        } else if addtid {
+            self.c(0)
+        } else {
+            self.vreg(Self::fv(d, "ADDR") + 1)
         }
     }
 
@@ -224,4 +304,34 @@ impl Lw {
         };
         self.window_at(hi, lo, &[Ea::U(l4), off], write);
     }
+}
+
+/// `XCL_WINDOW_NO_CARRY=1`: an access goes to the window of its base address. Allocations never
+/// straddle windows (`gpu::uma`), so an access inside the allocation its base points into never
+/// carries or borrows into the high dword, and the low dword is its offset in that window. Without
+/// the 64-bit sum, accesses off the same base share their window, its range check and its heap
+/// handle instead of computing them each, which makes the driver's code for big compute programs
+/// smaller (on NVIDIA its shader code heap is limited, #2403). An access that leaves its base's
+/// window (outside its allocation) stays in that window, wrapping its low dword. It applies with
+/// heap windows only (`window_at`). A title reservation over 4 GiB still spans windows
+/// (`Uma::sparse_reserve` logs it).
+pub fn no_carry() -> bool {
+    if let Some(on) = NO_CARRY_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WINDOW_NO_CARRY").is_ok_and(|v| v.trim() == "1"))
+}
+
+thread_local! {
+    /// `no_carry` for translations on this thread (`with_no_carry`; unset: `XCL_WINDOW_NO_CARRY`)
+    static NO_CARRY_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` with `no_carry` set to `on` on this thread (the translator thread takes its caller's).
+pub fn with_no_carry<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = NO_CARRY_TEST.with(|c| c.replace(Some(on)));
+    let r = f();
+    NO_CARRY_TEST.with(|c| c.set(old));
+    r
 }

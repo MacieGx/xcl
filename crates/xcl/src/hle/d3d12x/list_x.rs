@@ -59,17 +59,9 @@ const MAX_FILL: u64 = 256 << 20;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog timeout for GPU `queue.Wait` so a genuinely hung GPU cycle never triggers a 30 s
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
-/// cleanly without prematurely breaking synchronization.
+/// cleanly without prematurely breaking synchronization. Overridable via `XCL_GPU_WAIT_TIMEOUT_MS`
+/// for diagnostics.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
-
-/// lab: `XCL_GPU_WAIT_MS=n` – the watchdog releases a GPU wait on the CPU after n ms instead of 5000
-/// (a release lets the waiting queue run ahead of what the title made it wait for).
-fn gpu_wait_watchdog_timeout() -> Duration {
-    static T: LazyLock<Duration> = LazyLock::new(|| {
-        std::env::var("XCL_GPU_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(GPU_WAIT_WATCHDOG_TIMEOUT, Duration::from_millis)
-    });
-    *T
-}
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -82,6 +74,18 @@ fn wait_timeout() -> Duration {
             .filter(|&ms| ms > 0)
             .map(Duration::from_millis)
             .unwrap_or(WAIT_TIMEOUT)
+    })
+}
+
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("XCL_GPU_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(GPU_WAIT_WATCHDOG_TIMEOUT)
     })
 }
 
@@ -145,45 +149,88 @@ fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
 /// a query: (heap, index)
 type Query = (usize, u32);
 
-/// One list's occlusion queries: the one active on the PC (with its type) and the outer ones
-/// it ended early.
+/// Number of command lists currently inside an active occlusion query (zero-cost fast-path guard
+/// for `note_dropped_draw` on the hot draw path).
+static ACTIVE_OCCLUSION_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One list's occlusion queries: the one active on the PC (with its type and whether any draw
+/// inside it was skipped or rendered with a pending stand-in PSO) and the outer ones it ended early.
 #[derive(Default)]
 struct Occlusion {
-    active: Option<(Query, D3D12_QUERY_TYPE)>,
+    active: Option<(Query, D3D12_QUERY_TYPE, bool)>,
     ended_early: Vec<Query>,
+}
+
+impl Drop for Occlusion {
+    fn drop(&mut self) {
+        if self.active.is_some() {
+            ACTIVE_OCCLUSION_LISTS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Occlusion {
     /// Begin `q` on the PC; Some(outer): end that one on the PC first.
     fn begin(&mut self, q: Query, ty: D3D12_QUERY_TYPE) -> Option<(Query, D3D12_QUERY_TYPE)> {
-        let outer = self.active.replace((q, ty));
-        if let Some((o, _)) = outer {
-            self.ended_early.push(o);
+        let outer = self.active.replace((q, ty, false));
+        match outer {
+            None => {
+                ACTIVE_OCCLUSION_LISTS.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Some((o, oty, _)) => {
+                self.ended_early.push(o);
+                Some((o, oty))
+            }
         }
-        outer
     }
 
     /// End the currently active PC query early (e.g. before a `KickoffX` split), so `EndQuery`
     /// later resolves it as visible.
     fn end_active_early(&mut self) -> Option<(Query, D3D12_QUERY_TYPE)> {
-        let active = self.active.take()?;
-        self.ended_early.push(active.0);
-        Some(active)
+        let (q, ty, _) = self.active.take()?;
+        ACTIVE_OCCLUSION_LISTS.fetch_sub(1, Ordering::Relaxed);
+        self.ended_early.push(q);
+        Some((q, ty))
     }
 
-    /// Whether the PC ends `q` (not: an outer one already ended – it resolves as visible).
-    fn end(&mut self, q: Query) -> bool {
-        if self.active.is_some_and(|(a, _)| a == q) {
-            self.active = None;
-            return true;
+    /// Record that a draw inside the currently active occlusion query was skipped or used a
+    /// pending stand-in PSO, so the query must resolve as visible rather than falsely culling.
+    fn mark_dropped_draw(&mut self) {
+        if let Some(a) = &mut self.active {
+            a.2 = true;
+        }
+    }
+
+    /// Returns `(forward_pc_end, force_visible)`:
+    /// - `forward_pc_end`: whether the PC list must call `EndQuery` for `q`.
+    /// - `force_visible`: whether `ResolveQueryData` must overwrite `q` with a visible count
+    ///   (either an outer nested/split query ended early, or an active query that saw a dropped draw).
+    fn end(&mut self, q: Query) -> (bool, bool) {
+        if self.active.is_some_and(|(a, _, _)| a == q) {
+            let (_, _, dropped) = self.active.take().unwrap();
+            ACTIVE_OCCLUSION_LISTS.fetch_sub(1, Ordering::Relaxed);
+            return (true, dropped);
         }
         match self.ended_early.iter().position(|e| *e == q) {
             Some(i) => {
                 self.ended_early.swap_remove(i);
-                false
+                (false, true)
             }
-            None => true,
+            None => (true, false),
         }
+    }
+}
+
+/// Called by `bind` when a graphics draw on `list` is skipped or uses a pending stand-in PSO:
+/// if `list` currently has an open occlusion query, force it to resolve as visible so the title
+/// does not falsely occlusion-cull world geometry while shaders compile or fail to bind.
+pub(super) fn note_dropped_draw(list: *mut c_void) {
+    if list.is_null() || ACTIVE_OCCLUSION_LISTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        s.occlusion.mark_dropped_draw();
     }
 }
 
@@ -287,6 +334,7 @@ struct Bindings {
     title_view_heap: u64,
     /// lab: console address of the title's bound sampler heap (0: none)
     title_sampler_heap: u64,
+    has_sampler_heap: bool,
     topology: Option<u32>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
@@ -642,6 +690,16 @@ struct ListState {
     predication: Option<D3D12_PREDICATION_OP>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// what this segment records at the submit (`defer`)
+    deferred: Option<Deferred>,
+    /// on a title list's first segment: the allocator its deferred segments record on (the title's may be recording another list by the submit)
+    own_alloc: Option<ID3D12CommandAllocator>,
+}
+
+/// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
+pub(super) enum Deferred {
+    Dispatch(u32, u32, u32),
+    Indirect(usize, u32, usize, u64, usize, u64),
 }
 
 impl ListState {
@@ -842,6 +900,12 @@ pub(super) fn on_release(list: usize) {
         if !old.write64_signals.is_empty() {
             WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
+        // (the title may release a list the GPU still runs: its allocator must outlive that)
+        if let Some(a) = old.own_alloc {
+            if unsafe { super::alloc_pool::allocator_in_flight(a.as_raw() as usize) } {
+                std::mem::forget(a);
+            }
+        }
     }
 }
 
@@ -859,6 +923,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
+        s.deferred = None;
     }
 }
 
@@ -1193,6 +1258,45 @@ fn dump_sync_trace(why: &str, n: &AtomicU64, times: u64) {
     }
 }
 
+/// A `queue.Wait` XCL itself put on a queue (sparse uploads and readbacks, texture page
+/// mappings). These are not in `SYNC_GRAPH`; the GPU wait watchdog lists the unmet ones, so a
+/// producer queue that stands behind one of them shows in the log.
+struct InternalWait {
+    what: &'static str,
+    fence: ID3D12Fence,
+    value: u64,
+    at: Instant,
+}
+
+static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex::new(None);
+
+/// `queue` was made to wait for `fence` >= `value` by XCL (`what` says for what).
+pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
+    let mut g = INTERNAL_WAITS.lock().unwrap();
+    let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
+}
+
+/// The internal waits not yet met: `q<id>: <what> >= <value> (done <completed>, <age> ms)`.
+fn internal_waits_summary() -> String {
+    let unmet: Vec<(usize, String)> = {
+        let g = INTERNAL_WAITS.lock().unwrap();
+        g.iter()
+            .flat_map(|m| m.iter())
+            .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
+            .filter_map(|(q, w)| {
+                let done = unsafe { w.fence.GetCompletedValue() };
+                (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
+            })
+            .collect()
+    };
+    if unmet.is_empty() {
+        return "none".into();
+    }
+    unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1393,6 +1497,15 @@ unsafe fn publish_cpu_cycle_break_with(va: u64, val: u64, uma: Option<&crate::gp
     }
 }
 
+/// Remove a synthetic test fence and queue entry from `SYNC_GRAPH` before they are dropped.
+#[cfg(test)]
+pub(super) fn forget_title_fence_for_test(fence: usize, queue: usize) {
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        graph.title_fences.remove(&fence);
+        graph.queue_seq.remove(&queue);
+    }
+}
+
 /// Before a title `ID3D12CommandQueue::Signal(title_fence, value)` is submitted, check if it would
 /// close a mixed cycle passing through any `Wait64BitValueX` `SyncCell`. If so, release that
 /// `SyncCell` on CPU BEFORE the title signal executes so Vulkan never enters a semaphore cycle.
@@ -1499,6 +1612,14 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
+/// Whether an armed GPU wait has outlasted the watchdog; its clock stands while a submit or bind is held for a pipeline build.
+fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
+    if held {
+        aw.armed_at = Instant::now();
+    }
+    aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout()
+}
+
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
@@ -1536,8 +1657,9 @@ fn wake_sync_watchdog() {
                         let mut waiter_q = 0usize;
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
-                        cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
+                        let held = super::pso_async::title_held();
+                        cell.armed_waits.retain_mut(|aw| {
+                            if wait_expired(aw, held) {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1592,6 +1714,7 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
             }
         });
     });
@@ -2363,6 +2486,7 @@ unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
 }
 
 fn reset_copy_scratch(list: *mut c_void) {
+    real::dispatch_chain::list_reset(list as usize);
     if let Some(scratch) = COPY_SCRATCH.lock().unwrap().active.get_mut(&(list as usize)) {
         scratch.recorded = false;
     }
@@ -2766,14 +2890,117 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
         return None;
     }
+    let next_pc = split(list, None)?;
+    static SPLITS: AtomicU64 = AtomicU64::new(0);
+    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || (n.is_power_of_two() && n <= 256) {
+        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", list_type(next_pc).0);
+    }
+    Some(next_pc)
+}
+
+/// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
+pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+    if split(list, Some(what)).is_none() {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
+    }
+    true
+}
+
+/// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
+const WANTED_AT_ONCE: usize = 4;
+
+/// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
+pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
+    let mut segs = Vec::new();
+    super::title_list::push_segments(wrapper, &mut segs);
+    let Some(&first) = segs.first() else { return };
+    segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
+    let mut last: Option<*mut c_void> = None;
+    for (i, &seg) in segs.iter().enumerate().skip(1) {
+        for &ahead in segs[i..].iter().take(WANTED_AT_ONCE) {
+            super::bind::want_bound(ahead);
+        }
+        let Some((what, ty, heaps)) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| Some((s.deferred.take()?, s.list_type?, s.bindings.heaps.clone()))) else {
+            continue;
+        };
+        let Some(own) = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(first as usize))?.own_alloc.clone()) else {
+            super::bind::dispatch_dropped();
+            continue;
+        };
+        let own = own.as_raw();
+        let ext = *(seg as *const usize);
+        let mut hr = match last {
+            Some(_) => 0,
+            None => super::alloc_pool::title_reset(own).unwrap_or_else(|| real::reset_pc_allocator(own)),
+        };
+        if hr >= 0 {
+            hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, 0));
+        }
+        real::preserve_vtable(seg, ext);
+        if hr < 0 {
+            static RESET_ERR: AtomicU64 = AtomicU64::new(0);
+            warn(&RESET_ERR, "deferred dispatch", format_args!("Reset failed ({hr:#x})"));
+            super::bind::dispatch_dropped();
+            continue;
+        }
+        reset_copy_scratch(seg);
+        if !heaps.is_empty() {
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(seg, 28)(seg, heaps.len() as u32, heaps.as_ptr());
+        }
+        if let Some(last) = last {
+            super::bind::pass_arena(last, seg);
+            real::dispatch_chain::list_follows(last as usize, seg as usize);
+        }
+        match what {
+            Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
+            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
+        }
+        let ext = *(seg as *const usize);
+        pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
+        real::preserve_vtable(seg, ext);
+        last = Some(seg);
+    }
+}
+
+/// The allocator `list`'s put-off calls recorded on is reset once the GPU is done with them, so
+/// their split dispatches' scratch does not outlive them.
+unsafe fn reset_own_alloc(list: *mut c_void) {
+    let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))?.own_alloc.clone());
+    let Some(own) = own else { return };
+    let own = own.as_raw();
+    // (without `alloc_pool` nothing says whether the GPU is done: the next submit resets it)
+    if super::alloc_pool::enabled() && !super::alloc_pool::allocator_in_flight(own as usize) {
+        super::alloc_pool::title_reset(own).unwrap_or_else(|| real::reset_pc_allocator(own));
+    }
+}
+
+/// Ends `list`'s segment and opens the next; with `dispatch`, a closed segment for it comes between.
+unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
-    if !super::title_list::can_split(wrapper) {
+    if !super::title_list::can_split(wrapper, 1 + dispatch.is_some() as usize) {
         return None;
     }
     let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
+    let deferred = match dispatch {
+        Some(what) => {
+            // (a predicated call stays in its list)
+            let plain = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.allocator != 0 && s.predication.is_none());
+            if !plain {
+                return None;
+            }
+            Some((what, deferred_segment(wrapper, list, ty)?))
+        }
+        None => None,
+    };
     let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
@@ -2814,14 +3041,14 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     real::preserve_vtable(list, ext);
     if close_hr < 0 {
         static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
-        warn(&CLOSE_ERR, "Wait64 mid-list split", format_args!("Close failed ({close_hr:#x})"));
+        warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x})"));
         return None;
     }
 
     let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
         0
     } else {
-        super::pso_async::resolve_for_bind(bound_pso)
+        super::pso_async::resolve(bound_pso)
     };
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
@@ -2847,11 +3074,17 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
+                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
                 return None;
             }
         },
     };
+
+    // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    super::dred::reset(next_pc);
+    if init_pso != 0 {
+        super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
+    }
 
     let old_next = {
         let mut g = LISTS.lock().unwrap();
@@ -2944,13 +3177,56 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         }
     }
 
-    super::title_list::activate_segment(wrapper, list, next_pc);
-    static SPLITS: AtomicU64 = AtomicU64::new(0);
-    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
+    if let Some((what, seg)) = deferred {
+        {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.get_or_insert_with(HashMap::new).entry(seg as usize).or_default();
+            s.list_type = Some(ty);
+            s.bindings.heaps = bindings.heaps.clone();
+            s.deferred = Some(what);
+        }
+        super::bind::inherit_for_split(list, seg, alloc);
+        super::bind::pass_arena(list, next_pc);
     }
+    super::title_list::activate_segment(wrapper, list, next_pc);
     Some(next_pc)
+}
+
+/// A closed, empty segment of `wrapper`'s recording for a dispatch recorded at the submit, on the wrapper's own allocator.
+unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    let dev = device_of(list)?;
+    let mut segs = Vec::new();
+    super::title_list::push_segments(wrapper, &mut segs);
+    let first = *segs.first()? as usize;
+    let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&first)?.own_alloc.clone());
+    let own = match own {
+        Some(a) => a,
+        None => {
+            let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+            if !real::is_adopted(a.as_raw()) {
+                real::adopt(a.as_raw(), real::Kind::CommandAllocator);
+            }
+            LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(first).or_default().own_alloc = Some(a.clone());
+            a
+        }
+    };
+    let own = own.as_raw() as usize;
+    let emptied = |p: &*mut c_void| {
+        let p = *p;
+        let ext = *(p as *const usize);
+        let hr = super::alloc_pool::reset_list(p as usize, own, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(p, PC_RESET)(p, pc_alloc, 0));
+        real::preserve_vtable(p, ext);
+        hr >= 0
+    };
+    let p = match super::title_list::pop_spare(wrapper).filter(emptied) {
+        Some(p) => p,
+        None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
+    };
+    let ext = *(p as *const usize);
+    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+    real::preserve_vtable(p, ext);
+    super::title_list::push_segment(wrapper, p);
+    Some(p)
 }
 
 /// Record a `Wait32BitValueX` or `Wait64BitValueX` memory wait on `list`.
@@ -3332,6 +3608,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
+    }
+    if let Some(wrapper) = super::title_list::wrapper_of(this) {
+        record_deferred(wrapper);
     }
 
     let q_raw = queue as *mut c_void;
@@ -3811,18 +4090,58 @@ unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_V
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
-/// The heaps a list binds for console code: a view heap in the shared shader-visible heap
-/// is that one (`console_heap`), which is bound whatever the title names (a console
-/// descriptor table may be in any heap); a view heap that kept its own shader-visible PC heap
-/// (no shared heap) is bound itself, for its local indices; sampler heaps as they are. A view
-/// heap whose views were meant for the shared heap but found no room there is CPU-only
-/// (`dev_create_descriptor_heap_x` dropped the flag) and cannot be bound.
+/// Ensure the shared shader-visible PC sampler heap exists when a console device is live so
+/// directly-indexed root signatures (`SAMPLER_HEAP_DIRECTLY_INDEXED`) never run with 0 sampler
+/// heaps bound (D3D12 #1419 / `0x887A0001`).
+unsafe fn ensure_global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
+    if let Some(s) = super::console_heap::global_sampler_heap() {
+        return Some(s);
+    }
+    let dev_raw = real::device_raw();
+    if let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) {
+        let _ = super::console_heap::shared_sampler_heap(dev);
+    }
+    super::console_heap::global_sampler_heap()
+}
+
+/// Build the default PC descriptor heap list to bind when a command list is missing a required
+/// shader-visible view heap (`heap_windows`) or sampler heap (`SAMPLER_HEAP_DIRECTLY_INDEXED`).
+/// Returns `Some((heaps, has_sampler_heap))` when `SetDescriptorHeaps` must be updated.
+fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[usize], has_sampler: bool) -> Option<(Vec<usize>, bool)> {
+    if current.is_empty() {
+        let mut out = Vec::with_capacity(2);
+        if let Some(v) = view {
+            out.push(v);
+        }
+        if let Some(s) = sampler {
+            out.push(s);
+        }
+        return (!out.is_empty()).then_some((out, sampler.is_some()));
+    }
+    if current.len() == 1 {
+        if !has_sampler {
+            if let Some(s) = sampler {
+                return Some((vec![current[0], s], true));
+            }
+        } else if let Some(v) = view {
+            return Some((vec![v, current[0]], true));
+        }
+    }
+    None
+}
+
+/// The heaps a list binds for console code: view and sampler heaps hosted in the shared
+/// shader-visible heaps (`console_heap`) bind those shared heaps whatever the title names
+/// (a console descriptor table may be copied via raw CPU memcpy from any heap); heaps that
+/// kept their own shader-visible PC heap bind themselves for their local indices. Heaps whose
+/// own PC backing was downgraded to CPU-only cannot be bound directly.
 pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12DescriptorHeap>> {
     let mut view_heap = super::console_heap::global_heap();
+    let mut sampler_heap = ensure_global_sampler_heap();
     let mut out = Vec::new();
     for k in 0..n as usize {
         let p = *heaps.add(k) as *mut c_void;
-        if p.is_null() || super::console_heap::in_global(p as usize) {
+        if p.is_null() || super::console_heap::in_global(p as usize) || super::console_heap::in_global_sampler(p as usize) {
             continue;
         }
         let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
@@ -3831,31 +4150,45 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
             if desc.Flags.contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
                 view_heap = Some(h.clone());
             }
+        } else if desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER {
+            if desc.Flags.contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+                sampler_heap = Some(h.clone());
+            }
         } else {
             out.push(Some(h.clone()));
         }
     }
     out.extend(view_heap.map(Some));
+    out.extend(sampler_heap.map(Some));
     out
 }
 
-/// Translated shaders with heap windows (`pso::heap_windows`) read the memory windows from the
-/// shared heap: a list that set no heaps (a dispatch with no views) gets it before the bind.
+/// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
+/// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
+/// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
+/// view heap with 0 sampler heaps).
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    if !crate::gpu::recomp::pso::heap_windows() {
+    let view = if crate::gpu::recomp::pso::heap_windows() {
+        super::console_heap::global_heap()
+    } else {
+        None
+    };
+    let sampler = ensure_global_sampler_heap();
+    let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
+    let sampler_raw = sampler.as_ref().map(|h| h.as_raw() as usize);
+    if view_raw.is_none() && sampler_raw.is_none() {
         return;
     }
-    let Some(g) = super::console_heap::global_heap() else { return };
-    let mut set = false;
+    let mut to_bind: Option<Vec<usize>> = None;
     with_bindings(this, |b| {
-        if b.heaps.is_empty() {
-            b.heaps = vec![g.as_raw() as usize];
-            set = true;
+        if let Some((next, has_sampler)) = default_bound_heaps(view_raw, sampler_raw, &b.heaps, b.has_sampler_heap) {
+            b.heaps = next.clone();
+            b.has_sampler_heap = has_sampler;
+            to_bind = Some(next);
         }
     });
-    if set {
-        let raw = [g.as_raw() as usize];
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, 1, raw.as_ptr());
+    if let Some(raw) = to_bind {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, raw.len() as u32, raw.as_ptr());
     }
 }
 
@@ -3891,20 +4224,34 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
         });
     }
     if heaps.is_null() || n == 0 {
-        // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
-        // before a translated draw or dispatch reads the memory windows from it)
-        with_bindings(this, |b| b.heaps.clear());
+        // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heaps again
+        // before a translated draw or dispatch reads memory windows or samplers from them)
+        with_bindings(this, |b| {
+            b.heaps.clear();
+            b.has_sampler_heap = false;
+        });
         return f(this, n, heaps);
     }
-    if super::console_heap::global_heap().is_none() {
+    if super::console_heap::global_heap().is_none() && super::console_heap::global_sampler_heap().is_none() {
         let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
-        with_bindings(this, |b| b.heaps = given);
+        let has_sampler = given.iter().any(|&p| {
+            let p = p as *mut c_void;
+            ID3D12DescriptorHeap::from_raw_borrowed(&p).is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+        });
+        with_bindings(this, |b| {
+            b.heaps = given;
+            b.has_sampler_heap = has_sampler;
+        });
         return f(this, n, heaps);
     }
     let h = pc_heaps(n, heaps);
+    let has_sampler = h.iter().any(|x| x.as_ref().is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
     let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
     let kept = raw.clone();
-    with_bindings(this, |b| b.heaps = kept);
+    with_bindings(this, |b| {
+        b.heaps = kept;
+        b.has_sampler_heap = has_sampler;
+    });
     f(this, raw.len() as u32, raw.as_ptr())
 }
 
@@ -4052,6 +4399,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     }
 
     reset_copy_scratch(this);
+    reset_own_alloc(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -4570,6 +4918,55 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
+const PC_CLEAR_UAV_UINT: usize = 49;
+const PC_CLEAR_UAV_FLOAT: usize = 50;
+
+/// The handles a ClearUnorderedAccessView* of console code goes to the PC with.
+#[derive(Debug, PartialEq)]
+enum UavClearHandles {
+    /// both are console slots: their PC UAVs (GPU: in the heap lists bind; CPU: in the
+    /// title's CPU-only heap)
+    Console { gpu: u64, cpu: u64 },
+    /// neither is a console slot: PC handles already
+    Pc,
+    /// one console slot and one not, or a slot with no shader-visible UAV
+    Unusable,
+}
+
+fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::console_heap::Slot>) -> UavClearHandles {
+    match (gpu, cpu) {
+        (None, None) => UavClearHandles::Pc,
+        (Some(g), Some(c)) if !g.sampler && !c.sampler && g.pc_gpu_uav != 0 => UavClearHandles::Console { gpu: g.pc_gpu_uav, cpu: c.pc_uav },
+        _ => UavClearHandles::Unusable,
+    }
+}
+
+/// command list #53 / #54 ClearUnorderedAccessViewUint / Float(GPU handle, CPU handle,
+/// resource, values[4], rects, rect list) (PC #49 / #50): console handles are addresses of
+/// console heap slots (heap #9 / #10), not PC descriptors
+unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let (gpu, cpu) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+        UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
+        UavClearHandles::Pc => (gpu, cpu),
+        UavClearHandles::Unusable => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if once(&N, 1) {
+                crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView with GPU handle {gpu:#x} / CPU handle {cpu:#x}: not both a console slot with a shader-visible UAV – not done");
+            }
+            return;
+        }
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
+}
+
+pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    clear_uav(this, PC_CLEAR_UAV_UINT, gpu, cpu, res, values as *const c_void, n, rects)
+}
+
+pub(super) unsafe extern "system" fn clear_uav_float_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const f32, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    clear_uav(this, PC_CLEAR_UAV_FLOAT, gpu, cpu, res, values as *const c_void, n, rects)
+}
+
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
 const PC_RESOLVE_SUBRESOURCE_REGION: usize = 64;
 
@@ -4661,7 +5058,7 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     if is_occlusion(ty) {
-        let forward = LISTS
+        let (forward, force_visible) = LISTS
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -4669,9 +5066,11 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
             .or_default()
             .occlusion
             .end((heap, index));
-        if !forward {
+        if force_visible {
             let v = if ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION { 1 } else { VISIBLE_SAMPLES };
             VISIBLE.lock().unwrap().get_or_insert_with(HashMap::new).insert((heap, index), v);
+        }
+        if !forward {
             return;
         }
     }
@@ -4679,9 +5078,9 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 }
 
 /// command list #30 ResolveQueryData(heap, type, first, count, destination, offset) (PC #54):
-/// outer occlusion queries ended early are written over the resolved data (after it, in COPY_DEST as
-/// ResolveQueryData wants the destination). Buffers placed below their console address add
-/// `buffer_delta(dest)` to the destination offset.
+/// outer occlusion queries ended early (or queries whose draws were dropped/pending) are written
+/// over the resolved data (after it, in COPY_DEST as ResolveQueryData wants the destination).
+/// Buffers placed below their console address add `buffer_delta(dest)` to the destination offset.
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
     // (8 bytes a query; pipeline statistics, the largest, are 11 values)
     note_copy_into(this as usize, dest, offset, count as u64 * if ty == D3D12_QUERY_TYPE_PIPELINE_STATISTICS { 88 } else { 8 });
@@ -4696,8 +5095,25 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
         _ => return,
     };
     let dest = dest as *mut c_void;
-    let Some(res) = ID3D12Resource::from_raw_borrowed(&dest).filter(|_| !visible.is_empty()) else { return };
-    let at = res.GetGPUVirtualAddress().saturating_add(pc_offset);
+    if dest.is_null() || visible.is_empty() {
+        return;
+    }
+    // `dest` may be an adopted console ID3D12Resource whose slot 11 (`GetGPUVirtualAddress`)
+    // returns the console CPU UMA address; `WriteBufferImmediate` requires the real PC GPU VA.
+    // Guard `real::orig_fn` with `real::is_adopted` so unadopted PC resources (and test fakes)
+    // do not read `vt[-1]` out of bounds.
+    let pc_va = if real::is_adopted(dest) {
+        type GpuVaFn = unsafe extern "system" fn(*mut c_void) -> u64;
+        std::mem::transmute::<usize, GpuVaFn>(real::orig_fn(dest, 11))(dest)
+    } else if let Some(res) = ID3D12Resource::from_raw_borrowed(&dest) {
+        res.GetGPUVirtualAddress()
+    } else {
+        return;
+    };
+    if pc_va == 0 {
+        return;
+    }
+    let at = pc_va.saturating_add(pc_offset);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = visible
         .iter()
         .flat_map(|&(i, v)| {
@@ -4714,6 +5130,30 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// An internal wait shows in the watchdog's summary while its fence is short of the value,
+    /// and is gone from it once the fence gets there.
+    #[test]
+    fn an_internal_wait_is_listed_until_its_fence_reaches_the_value() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let queue = fence.as_raw() as usize; // any address no real queue has
+            note_internal_wait(queue, "test wait 7d1c", &fence, 3);
+            let s = internal_waits_summary();
+            assert!(s.contains("test wait 7d1c >= 0x3 (done 0x0"), "{s}");
+            fence.Signal(3).unwrap();
+            let s = internal_waits_summary();
+            assert!(!s.contains("test wait 7d1c"), "{s}");
+        }
+    }
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {
@@ -4787,11 +5227,15 @@ mod tests {
                 scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
             }
             on_create(raw, alloc.as_raw() as usize, 0, ty);
-            {
+            // Read under the lock, assert after it: a failed assert while holding the lock poisons
+            // COPY_SCRATCH, the list's Release hook (`real::cl_release`) then panics on it while the
+            // test unwinds, and that aborts the whole test binary.
+            let (active, released) = {
                 let cache = COPY_SCRATCH.lock().unwrap();
-                assert!(!cache.active.contains_key(&key), "the new list starts without one");
-                assert!(!cache.released.is_empty(), "the GPU may still use it: it stays until the fence");
-            }
+                (cache.active.contains_key(&key), !cache.released.is_empty())
+            };
+            assert!(!active, "the new list starts without one");
+            assert!(released, "the GPU may still use it: it stays until the fence");
             fence.Signal(1).unwrap();
             on_release(key);
             super::super::alloc_pool::forget(alloc.as_raw() as usize);
@@ -4812,21 +5256,22 @@ mod tests {
         let mut o = Occlusion::default();
         assert_eq!(o.begin((1, 0), ty), None);
         assert_eq!(o.begin((1, 1), ty), Some(((1, 0), ty)), "the outer one ends on the PC");
-        assert!(o.end((1, 1)), "inner: a real query");
+        assert_eq!(o.end((1, 1)), (true, false), "inner: a real query");
         // more per-object queries inside the same outer one
         assert_eq!(o.begin((1, 2), ty), None);
-        assert!(o.end((1, 2)));
-        assert!(!o.end((1, 0)), "outer: already ended");
+        assert_eq!(o.end((1, 2)), (true, false));
+        assert_eq!(o.end((1, 0)), (false, true), "outer: already ended");
         // overlapping, not nested: A, B, end A, end B
         assert_eq!(o.begin((1, 3), ty), None);
         assert_eq!(o.begin((1, 4), ty), Some(((1, 3), ty)));
-        assert!(!o.end((1, 3)) && o.end((1, 4)));
+        assert_eq!(o.end((1, 3)), (false, true));
+        assert_eq!(o.end((1, 4)), (true, false));
         assert!(o.active.is_none() && o.ended_early.is_empty());
-        assert!(o.end((1, 9)), "a query not begun here: the PC's call");
+        assert_eq!(o.end((1, 9)), (true, false), "a query not begun here: the PC's call");
         // kickoff ends active query early so EndQuery later resolves it as visible
         assert_eq!(o.begin((1, 5), D3D12_QUERY_TYPE_BINARY_OCCLUSION), None);
         assert_eq!(o.end_active_early(), Some(((1, 5), D3D12_QUERY_TYPE_BINARY_OCCLUSION)));
-        assert!(!o.end((1, 5)));
+        assert_eq!(o.end((1, 5)), (false, true));
     }
 
     #[test]
@@ -5526,12 +5971,18 @@ mod tests {
             assert_eq!(fake.calls.lock().unwrap().last(), Some(&Vec::new()));
             ensure_view_heap(list);
             with_bindings(list, |b| bound = b.heaps.clone());
-            match super::super::console_heap::global_heap() {
-                Some(g) if crate::gpu::recomp::pso::heap_windows() => {
-                    assert_eq!(bound, vec![g.as_raw() as usize], "the shared heap is bound again");
-                    assert_eq!(fake.calls.lock().unwrap().last(), Some(&vec![g.as_raw() as usize]));
+            let mut expected = Vec::new();
+            if crate::gpu::recomp::pso::heap_windows() {
+                if let Some(g) = super::super::console_heap::global_heap() {
+                    expected.push(g.as_raw() as usize);
                 }
-                _ => assert!(bound.is_empty()),
+            }
+            if let Some(s) = super::super::console_heap::global_sampler_heap() {
+                expected.push(s.as_raw() as usize);
+            }
+            assert_eq!(bound, expected, "the shared heaps are bound again");
+            if !expected.is_empty() {
+                assert_eq!(fake.calls.lock().unwrap().last(), Some(&expected));
             }
         }
         LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
@@ -7236,6 +7687,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_gpu_wait_does_not_expire_while_the_title_is_held_for_a_build() {
+        let old = Instant::now() - gpu_wait_watchdog_timeout() * 2;
+        let mut aw = ArmedGpuWait { val: 1, waiting_queue: 0, waiting_queue_ty: 0, wait_seq: 1, armed_at: old, after_write64: false };
+        assert!(!wait_expired(&mut aw, true));
+        assert!(!wait_expired(&mut aw, false), "its clock starts again when the hold ends");
+        aw.armed_at = old;
+        assert!(wait_expired(&mut aw, false));
+    }
+
+    #[test]
+    fn a_dispatch_with_a_pipeline_still_building_waits_at_the_submit() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let standin = 0x7E57_D001usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            bind::reset(pc0, alloc.as_raw() as usize, standin);
+            let wrap = title_list::wrap(pc0);
+
+            const DISPATCHES: usize = 210;
+            let mut segs = vec![pc0];
+            for n in 1..=DISPATCHES {
+                let t = Instant::now();
+                bind::dispatch(*segs.last().unwrap(), 1, 1, 1);
+                assert!(t.elapsed() < Duration::from_millis(700), "dispatch {n} waited for the build ({:?})", t.elapsed());
+                segs.clear();
+                assert!(title_list::push_segments(wrap, &mut segs));
+            }
+            assert_eq!(segs.len(), 1 + 2 * DISPATCHES, "the list before each dispatch, the dispatch, the list after it");
+            assert!(pso_async::is_pending(standin));
+
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+            assert!(pso_async::is_pending(standin), "Close waited for the build");
+
+            let skipped = bind::counts_snapshot()[4];
+            let build = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                BUILD.store(true, Ordering::Release);
+            });
+            record_deferred(wrap);
+            assert!(!pso_async::is_pending(standin), "the submit waits for the build");
+            assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
+            build.join().unwrap();
+
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the split list runs");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
+
     /// Reproduces the exact intra-list fork-join pattern seen on retail compute queues:
     ///   q_compute list O_c: Write64(cell_A, frame) -> Wait64(cell_B >= frame) -> Write64(cell_C, frame)
     ///   q_direct  list O_d: Wait64(cell_A >= frame) -> Write64(cell_B, frame)
@@ -7418,6 +7958,175 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    #[test]
+    fn occlusion_tracks_dropped_draws_and_active_counter() {
+        let mut occ = Occlusion::default();
+        // Clean query with no dropped draws: forwards PC EndQuery and keeps true GPU count.
+        assert_eq!(occ.begin((1, 0), D3D12_QUERY_TYPE_OCCLUSION), None);
+        assert!(ACTIVE_OCCLUSION_LISTS.load(Ordering::Relaxed) >= 1);
+        assert_eq!(occ.end((1, 0)), (true, false));
+
+        // Query that sees a dropped/pending draw: forwards PC EndQuery AND forces visible.
+        assert_eq!(occ.begin((1, 1), D3D12_QUERY_TYPE_OCCLUSION), None);
+        occ.mark_dropped_draw();
+        assert_eq!(occ.end((1, 1)), (true, true));
+
+        // Nested query: outer ends early (force visible, no second PC EndQuery), inner counts cleanly.
+        assert_eq!(occ.begin((1, 2), D3D12_QUERY_TYPE_OCCLUSION), None);
+        assert_eq!(occ.begin((1, 3), D3D12_QUERY_TYPE_BINARY_OCCLUSION), Some(((1, 2), D3D12_QUERY_TYPE_OCCLUSION)));
+        assert!(ACTIVE_OCCLUSION_LISTS.load(Ordering::Relaxed) >= 1);
+        assert_eq!(occ.end((1, 3)), (true, false));
+        assert_eq!(occ.end((1, 2)), (false, true));
+
+        // End-to-end `note_dropped_draw` fast-path + LISTS integration.
+        let fake_list = 0xDEAD_BEE0usize as *mut c_void;
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(fake_list as usize).or_default().occlusion.begin((7, 42), D3D12_QUERY_TYPE_OCCLUSION);
+        note_dropped_draw(fake_list);
+        let res = LISTS.lock().unwrap().as_mut().unwrap().remove(&(fake_list as usize)).unwrap().occlusion.end((7, 42));
+        assert_eq!(res, (true, true));
+    }
+
+    #[test]
+    fn default_bound_heaps_always_includes_sampler_heap_when_available() {
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[], false), Some((vec![0x10, 0x20], true)));
+        assert_eq!(default_bound_heaps(None, Some(0x20), &[], false), Some((vec![0x20], true)));
+        assert_eq!(default_bound_heaps(Some(0x10), None, &[], false), Some((vec![0x10], false)));
+        // Shared view heap bound alone -> append shared sampler heap
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10], false), Some((vec![0x10, 0x20], true)));
+        // Non-global view heap bound alone, or heap_windows() == false (view == None) -> still append shared sampler heap
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
+        assert_eq!(default_bound_heaps(None, Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
+        // Sampler heap bound alone when heap_windows() needs the shared view heap -> prepend view heap
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x99], true), Some((vec![0x10, 0x99], true)));
+        assert_eq!(default_bound_heaps(None, Some(0x20), &[0x99], true), None);
+        // Both heaps already bound -> no-op
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x20], true), None);
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x99], true), None);
+    }
+
+    /// ClearUnorderedAccessView* handles: two console slots → their PC UAVs, two PC handles as
+    /// they are, anything else not usable.
+    #[test]
+    fn uav_clear_handles_translate_console_slots() {
+        use super::super::console_heap::Slot;
+        let s = |pc_uav: u64, pc_gpu_uav: u64, sampler: bool| Some(Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav, pc_gpu_uav, sampler, shared_srv: 0, k: 0 });
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), s(0x20, 0, false)), UavClearHandles::Console { gpu: 0x5010, cpu: 0x20 });
+        assert_eq!(uav_clear_handles(None, None), UavClearHandles::Pc);
+        // a console slot beside a PC handle, a GPU slot of a heap that is not shader visible,
+        // sampler slots
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), None), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(None, s(0x20, 0, false)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0x10, 0, false), s(0x20, 0, false)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), s(0, 0, true)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0, 0, true), s(0x20, 0, false)), UavClearHandles::Unusable);
+    }
+
+    /// Console code clears a UAV with its console heap slots (heap #9 / #10 give it their
+    /// addresses): the clear reaches the PC with the slots' UAVs. Before, the slot addresses
+    /// went to the PC method as handles. On WARP (a software adapter).
+    #[test]
+    fn clear_uav_with_console_handles_clears_the_slots_view() {
+        use super::super::console_heap;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP");
+                return;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no WARP");
+                return;
+            }
+            let dev = dev.unwrap();
+            const N: u32 = 64;
+            let desc = |flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4 * N as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let committed = |ty, flags, state| {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: ty, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc(flags), state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let buf = committed(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let rb = committed(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            // the title's heaps of one view slot each (SRV, UAV): a CPU-only one and a shader-visible one
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let heap = |flags| -> ID3D12DescriptorHeap {
+                dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 2, Flags: flags, NodeMask: 0 }).unwrap()
+            };
+            let (cpu_heap, gpu_heap) = (heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE), heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE));
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { NumElements: N, ..Default::default() } },
+            };
+            for h in [&cpu_heap, &gpu_heap] {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + inc as usize };
+                dev.CreateUnorderedAccessView(&buf, None, Some(&uav), at);
+            }
+            let (co, go) = (cpu_heap.as_raw() as usize, gpu_heap.as_raw() as usize);
+            assert!(console_heap::register(co, 1, cpu_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, 0, inc, false, false, false));
+            assert!(console_heap::register(go, 1, gpu_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, gpu_heap.GetGPUDescriptorHandleForHeapStart().ptr, inc, false, false, true));
+            let (console_cpu, console_gpu) = (console_heap::start(co).unwrap(), console_heap::start(go).unwrap());
+
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+            l.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
+            // the title's call (#53) on the adopted list, then the PC vtable back
+            let raw = l.as_raw();
+            real::adopt(raw, real::Kind::CommandList);
+            clear_uav_uint_x(raw, console_gpu, console_cpu, buf.as_raw() as usize, [0xDEAD_BEEFu32; 4].as_ptr(), 0, std::ptr::null());
+            let ext = *(raw as *const *const usize);
+            *(raw as *mut usize) = *ext.sub(1);
+            let b = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: ManuallyDrop::new(Some(buf.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            };
+            l.ResourceBarrier(&[b]);
+            l.CopyResource(&rb, &buf);
+            l.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 5000).expect("the clear completes");
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let got = std::slice::from_raw_parts(p as *const u32, N as usize).to_vec();
+            rb.Unmap(0, None);
+            console_heap::unregister(co);
+            console_heap::unregister(go);
+            assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
     }
 }

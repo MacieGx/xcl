@@ -33,6 +33,10 @@ pub enum SBarrier {
 /// Rounds a waiting wave spins before it gives up (the HLSL `1u << 20`).
 pub const SPIN_LIMIT: u32 = 1 << 20;
 
+/// With LDS, the first of the two words of the LDS block the safe barrier takes (`alive`,
+/// then `state`; the split form's lane counter keeps 8191).
+pub const LDS_BAR_AT: u32 = 8189;
+
 /// The early-exit-safe barrier is on unless `XCL_SAFE_BARRIER=0` (the recompiler's switch).
 pub fn safe_barrier_enabled() -> bool {
     std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
@@ -69,16 +73,15 @@ impl Lw {
     }
 
     /// The safe barrier's two words (after [`Lw::setup_storage`]): in the LDS block when
-    /// the program has one (D3D12 allows 32 KB, all of it already the LDS: the program's
-    /// accesses stop below them), else two words of their own.
+    /// the program has one (D3D12 allows 32 KB, all of it already the LDS:
+    /// `Lw::lds_index` keeps the program's accesses off them), else two words of their own.
     pub fn setup_barrier_storage(&mut self) {
         if self.sbar != SBarrier::Safe {
             return;
         }
         if let Some(g) = self.lds {
             // split form: `setup_storage` put the exchange below them (`bar_lds_words`)
-            self.lds_top = self.lds_top.min(8188);
-            self.bar = Some((g, 8189));
+            self.bar = Some((g, LDS_BAR_AT));
         } else {
             let i32 = self.s.m.i32();
             let g = self.s.groupshared("xcl_bar", i32, 2);
