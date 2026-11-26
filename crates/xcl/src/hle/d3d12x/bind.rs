@@ -482,6 +482,12 @@ unsafe fn bind_two_pass_stage(
         // lab: what the program reads of the title's memory outside the unified windows
         super::view_mem::ensure_for_draw(layout.as_deref(), &args);
     }
+    // page budget: the textures in the bound descriptor tables are sampled, by the compute pass
+    // (the console MS) and by the pixel shader of the mesh pass alike (as `bind_abi`; CharlyRien's
+    // finding on #505: these draws never touched their tables)
+    if let Some(l) = layout.as_ref().filter(|_| super::vram::tracking()) {
+        super::title_textures::tables_drawn(&table_addresses(l, &args, u.base()));
+    }
     let inline = layout
         .as_ref()
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)

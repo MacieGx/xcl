@@ -877,8 +877,11 @@ pub(super) fn drawn(res: &[usize]) {
 /// Slots of a bound descriptor table looked at (`tables_drawn`): a table's length is not in the
 /// root signature the title gives, and an image T# read past its end keeps one more texture at worst.
 /// (lab: 16 missed one bitmap layer of a loading card – two Scaleform tables named an evicted
-/// texture in slots 16..64, run m1)
-const TABLE_SLOTS: usize = 64;
+/// texture in slots 16..64, run m1; 64 missed the textures a retail title's tiled-lighting draws
+/// read in slots 88..155 of their first table, which stayed evicted at the submit – CharlyRien's
+/// measurement on #505: 78 % of the image T#s the title's shaders read are in slots >= 64, none
+/// in a slot >= 256)
+const TABLE_SLOTS: usize = 256;
 /// How often one table (by address) is looked at.
 const TABLE_LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -906,12 +909,12 @@ pub(super) fn tables_drawn(tables: &[usize]) {
         let first = table_textures(at, TABLE_SLOTS, super::console_heap::index_resource);
         // lab: evicted textures named past the slots looked at (they stay evicted)
         if super::vram::any_evicted() {
-            let past = table_textures(at, 4 * TABLE_SLOTS, super::console_heap::index_resource).into_iter().filter(|r| !first.contains(r) && super::vram::is_evicted(*r)).count() as u64;
+            let past = table_textures(at, 2 * TABLE_SLOTS, super::console_heap::index_resource).into_iter().filter(|r| !first.contains(r) && super::vram::is_evicted(*r)).count() as u64;
             if past > 0 {
                 static PAST: AtomicU64 = AtomicU64::new(0);
                 let n = PAST.fetch_add(past, Ordering::Relaxed) + past;
                 if n.is_power_of_two() || (n - past).next_power_of_two() <= n {
-                    crate::xlog_info!("lab: table touch: {n} evicted textures named in slots {TABLE_SLOTS}..{} of bound tables so far (table {at:#x}: {past})", 4 * TABLE_SLOTS);
+                    crate::xlog_info!("lab: table touch: {n} evicted textures named in slots {TABLE_SLOTS}..{} of bound tables so far (table {at:#x}: {past})", 2 * TABLE_SLOTS);
                 }
             }
         }
