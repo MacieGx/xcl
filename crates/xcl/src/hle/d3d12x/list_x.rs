@@ -4580,10 +4580,11 @@ unsafe extern "system" fn resource_barrier_x_unmarked(this: *mut c_void, n: u32,
             if super::depth_twin::any() {
                 let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
                 if super::depth_twin::has(res) {
-                    const DEPTH_WRITE: u32 = 0x10;
+                    // (lab, `XCL_SRGB_TWIN`: a render target's stand-in is not a depth state)
+                    let stand_in = super::depth_twin::ua_stand_in(res);
                     for st in [5usize, 6] {
                         if b[st] & UNORDERED_ACCESS != 0 {
-                            b[st] = DEPTH_WRITE;
+                            b[st] = stand_in;
                         }
                     }
                     if flags != 1 {
@@ -4632,6 +4633,10 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
         if SKIPPED.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: depth twin of {res:#x} written on a list that is not a direct one: not copied");
         }
+        return;
+    }
+    // lab (`XCL_SRGB_TWIN`): a render target whose state no barrier has told us yet is left alone
+    if info.target && super::depth_twin::state_known(res, info.first).is_none() {
         return;
     }
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4728,6 +4733,9 @@ pub(super) unsafe fn depth_twin_fill(list: *mut c_void, res: usize, plane: u32) 
     }
     let Some(info) = super::depth_twin::info(res, plane).filter(|i| i.copy_in && i.staging != 0) else { return };
     if tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+    if info.target && super::depth_twin::state_known(res, info.first).is_none() {
         return;
     }
     let barrier = |r: usize, sub: u32, before: u32, after: u32| {

@@ -9,6 +9,14 @@
 //! compute pass (a X24_TYPELESS_G8_UINT UAV) and its lighting passes test / read that stencil;
 //! it also blits cached local-light shadow maps into D16 buffers with compute (R16_UNORM UAVs).
 //! With null views all of that was dropped. `XCL_DEPTH_TWIN=0`: off; `=s`: stencil twins only.
+//!
+//! `XCL_SRGB_TWIN=1` (lab, off by default): the same for a render target in R8G8B8A8_UNORM_SRGB
+//! that the console also gives an R8G8B8A8_UNORM UAV (the PC has no UAV of an sRGB resource, so
+//! `device_x::pc_resource_desc` drops the flag and the view was a null one). The retail title's
+//! hair resolve (`hair_resolve:CS_ResolveToGBufferTiled_N`) writes the G-buffer's albedo that
+//! way, and its depth through an R32_FLOAT_X8X24 UAV of the D32S8 buffer
+//! (`XCL_DEPTH_TWIN_PLANE0=3`). The twin is copied from the target before such a dispatch and
+//! back after it, and only once a barrier of the title has told us the target's state.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -35,6 +43,9 @@ pub struct Info {
     /// lab: the plane is copied into the twin before a dispatch that names it (the depth of a
     /// D32S8 buffer: a pass may write only some texels)
     pub copy_in: bool,
+    /// lab (`XCL_SRGB_TWIN`): the twin of a render target; its state is only what a barrier of
+    /// the title left (`state_known`), never taken to be DEPTH_WRITE
+    pub target: bool,
 }
 
 struct Twin {
@@ -66,9 +77,37 @@ fn mode() -> u8 {
 
 /// lab: twins of the depth plane of two-plane buffers. `XCL_DEPTH_TWIN_PLANE0`: bit 0 (1) the
 /// console's D16S8 (R24G8), bit 1 (2) D32S8 (R32G8X24); default 1.
-fn plane0_on(bit: u32) -> bool {
+fn plane0_bits() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("XCL_DEPTH_TWIN_PLANE0").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)) & bit != 0
+    *M.get_or_init(|| std::env::var("XCL_DEPTH_TWIN_PLANE0").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
+
+/// lab (`XCL_SRGB_TWIN=1`): twins for the UNORM UAVs of sRGB render targets.
+fn srgb_on() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("XCL_SRGB_TWIN").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The plane and the twin's format for a UAV in `view` (the PC's format) of a resource in
+/// `format` with one subresource a plane or not (`single`): None when there is no twin for it.
+/// `mode`: `XCL_DEPTH_TWIN` (0 off, 1 stencil only, 2 all); `plane0`: `XCL_DEPTH_TWIN_PLANE0`.
+fn twin_plane(format: i32, view: i32, single: bool, mode: u8, plane0: u32, srgb: bool) -> Option<(u32, DXGI_FORMAT)> {
+    // R32_TYPELESS / R16_TYPELESS (D32, D16): the one plane, a twin in the same format.
+    // R24G8_TYPELESS / R32G8X24_TYPELESS: the stencil (views X24_TYPELESS_G8_UINT /
+    // X32_TYPELESS_G8X24_UINT), an R8_UINT twin; a UAV of their depth stays a null view.
+    match (format, view) {
+        _ if mode == 0 => None,
+        (39 | 53, _) if mode == 2 => Some((0, DXGI_FORMAT(format))),
+        (44, 47) | (19, 22) if single => Some((1, DXGI_FORMAT_R8_UINT)),
+        // lab: the depth of a two-plane buffer. R24G8 (the console's D16S8: a retail title's material
+        // permutation, z = n / 65535, which its tile-lighting draws EQUAL-test): an R16_UNORM twin,
+        // written into the depth plane by a full-screen pass. R32G8X24: an R32_FLOAT twin, through a buffer.
+        (44, 46) if mode == 2 && plane0 & 1 != 0 && single => Some((0, DXGI_FORMAT_R16_UNORM)),
+        (19, 21) if mode == 2 && plane0 & 2 != 0 && single => Some((0, DXGI_FORMAT_R32_FLOAT)),
+        // lab: an sRGB render target's UNORM UAV (the same bytes: no conversion on a store)
+        (29, 28) if mode == 2 && srgb && single => Some((0, DXGI_FORMAT_R8G8B8A8_UNORM)),
+        _ => None,
+    }
 }
 
 /// The format of views of the twin of plane 0 of a depth buffer in `format` (None: the title's).
@@ -161,19 +200,8 @@ pub unsafe fn get_or_make(res: *mut c_void, view_format: i32) -> Option<(*mut c_
     if d.SampleDesc.Count != 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
         return None;
     }
-    // R32_TYPELESS / R16_TYPELESS (D32, D16): the one plane, a twin in the same format.
-    // R24G8_TYPELESS / R32G8X24_TYPELESS: the stencil (views X24_TYPELESS_G8_UINT /
-    // X32_TYPELESS_G8X24_UINT), an R8_UINT twin; a UAV of their depth stays a null view.
-    let (plane, twin_format) = match (d.Format.0, view_format) {
-        (39 | 53, _) if mode() == 2 => (0u32, d.Format),
-        (44, 47) | (19, 22) if d.DepthOrArraySize == 1 && d.MipLevels == 1 => (1, DXGI_FORMAT_R8_UINT),
-        // lab: the depth of a two-plane buffer. R24G8 (the console's D16S8: a retail title's material
-        // permutation, z = n / 65535, which its tile-lighting draws EQUAL-test): an R16_UNORM twin,
-        // written into the depth plane by a full-screen pass. R32G8X24: an R32_FLOAT twin, through a buffer.
-        (44, 46) if mode() == 2 && plane0_on(1) && d.DepthOrArraySize == 1 && d.MipLevels == 1 => (0, DXGI_FORMAT_R16_UNORM),
-        (19, 21) if mode() == 2 && plane0_on(2) && d.DepthOrArraySize == 1 && d.MipLevels == 1 => (0, DXGI_FORMAT_R32_FLOAT),
-        _ => return None,
-    };
+    let (plane, twin_format) = twin_plane(d.Format.0, view_format, d.DepthOrArraySize == 1 && d.MipLevels == 1, mode(), plane0_bits(), srgb_on())?;
+    let target = d.Format.0 == 29;
     let mut g = TWINS.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     if let Some(t) = m.get(&(res as usize, plane)) {
@@ -240,13 +268,13 @@ pub unsafe fn get_or_make(res: *mut c_void, view_format: i32) -> Option<(*mut c_
         dsv_heap = Some(heap);
     }
     let texel = match twin_format.0 {
-        39 | 41 => 4,
+        28 | 39 | 41 => 4,
         53 | 56 => 2,
         _ => 1,
     };
     let bytes = d.Width * d.Height as u64 * subs as u64 * texel;
     let total = BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    let info = Info { twin: twin.as_raw() as usize, staging: staging.as_ref().map_or(0, |s| s.as_raw() as usize), subs, first, fp_twin, fp_plane, dsv, copy_in: plane == 0 && d.Format.0 == 19 };
+    let info = Info { twin: twin.as_raw() as usize, staging: staging.as_ref().map_or(0, |s| s.as_raw() as usize), subs, first, fp_twin, fp_plane, dsv, copy_in: plane == 0 && matches!(d.Format.0, 19 | 29), target };
     m.insert((res as usize, plane), Twin { _res: twin, _staging: staging, _dsv_heap: dsv_heap, shape: shape(&d), info });
     ANY.store(true, Ordering::Relaxed);
     if m.len() <= 8 || m.len().is_power_of_two() || plane == 1 {
@@ -272,6 +300,18 @@ pub fn info(res: usize, plane: u32) -> Option<Info> {
 
 pub fn has(res: usize) -> bool {
     any() && TWINS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(res, 0)) || m.contains_key(&(res, 1)))
+}
+
+/// The PC state that stands for UNORDERED_ACCESS on a resource with a twin (the twin is the one
+/// written): DEPTH_WRITE for a depth buffer, as `device_x::pc_initial_state` creates it; for a
+/// render target (`XCL_SRGB_TWIN`) NON_PIXEL_SHADER_RESOURCE - DEPTH_WRITE is no state of a
+/// colour texture.
+pub fn ua_stand_in(res: usize) -> u32 {
+    stand_in(TWINS.lock().unwrap().as_ref().and_then(|m| m.get(&(res, 0))).is_some_and(|t| t.info.target))
+}
+
+fn stand_in(target: bool) -> u32 {
+    if target { 0x40 } else { 0x10 }
 }
 
 /// A view of the twin of (`res`, `plane`) is in the console slot whose descriptor starts with `w0`.
@@ -301,6 +341,13 @@ pub fn set_state(res: usize, sub: u32, state: u32) {
         m.retain(|k, _| k.0 != res);
     }
     m.insert((res, sub), state);
+}
+
+/// The PC state a barrier of the title left subresource `sub` of `res` in (None: it has not
+/// moved it since the twin was made).
+pub fn state_known(res: usize, sub: u32) -> Option<u32> {
+    let g = STATES.lock().unwrap();
+    g.as_ref().and_then(|m| m.get(&(res, sub)).or_else(|| m.get(&(res, u32::MAX))).copied())
 }
 
 /// The PC state of subresource `sub` of `res` as the title's barriers left it (DEPTH_WRITE
@@ -467,5 +514,50 @@ mod tests {
         alias_forget(a);
         alias_forget(b);
         assert!(!is_alias_src(b));
+    }
+
+    #[test]
+    fn twins_by_resource_and_view_format() {
+        // as it was: one-plane depth buffers, the stencil of two-plane ones, the D16S8 depth
+        assert_eq!(twin_plane(39, 41, false, 2, 1, false), Some((0, DXGI_FORMAT_R32_TYPELESS)));
+        assert_eq!(twin_plane(53, 56, false, 2, 1, false), Some((0, DXGI_FORMAT_R16_TYPELESS)));
+        assert_eq!(twin_plane(53, 56, false, 1, 1, false), None, "stencil twins only");
+        assert_eq!(twin_plane(44, 47, true, 1, 1, false), Some((1, DXGI_FORMAT_R8_UINT)));
+        assert_eq!(twin_plane(19, 22, true, 2, 1, false), Some((1, DXGI_FORMAT_R8_UINT)));
+        assert_eq!(twin_plane(19, 22, false, 2, 1, false), None, "mips or slices");
+        assert_eq!(twin_plane(44, 46, true, 2, 1, false), Some((0, DXGI_FORMAT_R16_UNORM)));
+        assert_eq!(twin_plane(44, 46, true, 2, 2, false), None);
+        // the D32S8 depth: only with bit 1 of XCL_DEPTH_TWIN_PLANE0
+        assert_eq!(twin_plane(19, 21, true, 2, 1, false), None);
+        assert_eq!(twin_plane(19, 21, true, 2, 3, false), Some((0, DXGI_FORMAT_R32_FLOAT)));
+        // an sRGB target's UNORM UAV: only with XCL_SRGB_TWIN, one subresource, all twins on
+        assert_eq!(twin_plane(29, 28, true, 2, 1, false), None);
+        assert_eq!(twin_plane(29, 28, true, 2, 1, true), Some((0, DXGI_FORMAT_R8G8B8A8_UNORM)));
+        assert_eq!(twin_plane(29, 28, false, 2, 1, true), None, "a mip chain stays a null view");
+        assert_eq!(twin_plane(29, 28, true, 1, 1, true), None);
+        assert_eq!(twin_plane(29, 29, true, 2, 1, true), None, "an sRGB UAV is not one the PC has");
+        assert_eq!(twin_plane(28, 28, true, 2, 1, true), None, "a UNORM target has its own UAV");
+        // off
+        for (f, v) in [(39, 41), (44, 47), (19, 21), (29, 28)] {
+            assert_eq!(twin_plane(f, v, true, 0, 3, true), None);
+        }
+    }
+
+    #[test]
+    fn a_target_state_is_unknown_until_a_barrier() {
+        let res = 0x7A11_0000usize;
+        assert_eq!(state_known(res, 0), None);
+        assert_eq!(state(res, 0), 0x10, "a depth buffer the title never moved: DEPTH_WRITE");
+        set_state(res, u32::MAX, 0x4);
+        assert_eq!(state_known(res, 0), Some(0x4));
+        set_state(res, 0, 0x80);
+        assert_eq!((state_known(res, 0), state_known(res, 1)), (Some(0x80), Some(0x4)));
+    }
+
+    #[test]
+    fn unordered_access_stands_as_a_state_the_resource_can_be_in() {
+        assert_eq!(stand_in(false), 0x10, "a depth buffer: DEPTH_WRITE");
+        assert_eq!(stand_in(true), 0x40, "a render target: a shader resource, never a depth state");
+        assert_eq!(ua_stand_in(0x7A11_0001), 0x10, "no twin of a target: as it was");
     }
 }
