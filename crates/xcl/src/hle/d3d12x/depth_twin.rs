@@ -338,8 +338,20 @@ struct Alias {
 }
 unsafe impl Send for Alias {}
 
-/// title address → the GPU-owned R32_UINT UAV texture placed there last
+/// title address → the GPU-owned R32_UINT UAV texture placed there last. The pointers are not
+/// references: an entry goes when its texture's last reference does (`alias_forget`, from the
+/// resource's Release), so one that is here is alive. (Before, a released source stayed here and
+/// `alias_pair` called into the freed object when another texture was placed at its address –
+/// CharlyRien's review on #505.)
 static ALIAS_SRC: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// The last reference of resource `res` is gone (or held for a late release): it is no alias
+/// source any more.
+pub fn alias_forget(res: usize) {
+    if let Some(m) = ALIAS_SRC.lock().unwrap().as_mut() {
+        m.retain(|_, r| *r != res);
+    }
+}
 /// UAV texture → its pair
 static ALIASES: Mutex<Option<HashMap<usize, Alias>>> = Mutex::new(None);
 
@@ -370,9 +382,15 @@ pub unsafe fn alias_pair(va: usize, res: *mut c_void) {
     if !alias_on() {
         return;
     }
-    let Some(&src) = ALIAS_SRC.lock().unwrap().as_ref().and_then(|m| m.get(&va)) else { return };
-    let src_raw = src as *mut c_void;
-    let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&res), ID3D12Resource::from_raw_borrowed(&src_raw)) else { return };
+    // (the source gets a reference of ours while `ALIAS_SRC` is held: `alias_forget` cannot pass)
+    let (src, s) = {
+        let g = ALIAS_SRC.lock().unwrap();
+        let Some(&src) = g.as_ref().and_then(|m| m.get(&va)) else { return };
+        let src_raw = src as *mut c_void;
+        let Some(s) = ID3D12Resource::from_raw_borrowed(&src_raw).cloned() else { return };
+        (src, s)
+    };
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&res) else { return };
     let (dd, sd) = (d.GetDesc(), s.GetDesc());
     if dd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || (dd.Width, dd.Height, dd.DepthOrArraySize, dd.MipLevels) != (sd.Width, sd.Height, sd.DepthOrArraySize, sd.MipLevels) {
         return;
@@ -425,4 +443,29 @@ pub fn is_alias_src(res: usize) -> bool {
 
 pub fn alias_info(res: usize) -> Option<AliasInfo> {
     ALIASES.lock().unwrap().as_ref()?.get(&res).map(|a| a.info.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An alias source is known only while its texture lives: the entry goes with the last
+    /// reference (`alias_forget`, from the resource's Release), and only that texture's.
+    #[test]
+    fn an_alias_source_is_forgotten_with_its_last_reference() {
+        let (a, b) = (0x7E57_A11A_5000usize, 0x7E57_A11A_6000usize);
+        {
+            let mut g = ALIAS_SRC.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            m.insert(0x7_1000_0000, a);
+            m.insert(0x7_2000_0000, b);
+        }
+        assert!(is_alias_src(a) && is_alias_src(b));
+        alias_forget(a);
+        assert!(!is_alias_src(a), "a released texture is no source any more");
+        assert!(is_alias_src(b), "another texture's entry stays");
+        alias_forget(a);
+        alias_forget(b);
+        assert!(!is_alias_src(b));
+    }
 }
