@@ -2052,6 +2052,16 @@ pub fn is_translated_compute(pso: usize) -> bool {
 /// build's stand-in (until it is resolved) and the fallback of a console shader that failed
 static CONSOLE_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// lab (`XCL_SKIP_LOG`): the console shaders of a stand-in or fallback pipeline, so that a
+/// skipped or put-off call of it can be named (`bind::skip_note_pso`).
+unsafe fn skip_log_name(ppv: *mut *mut c_void, first: &D3D12_SHADER_BYTECODE, second: Option<&D3D12_SHADER_BYTECODE>) {
+    if !super::bind::skip_log() || ppv.is_null() || (*ppv).is_null() {
+        return;
+    }
+    let hash = |b: &D3D12_SHADER_BYTECODE| shader_bytes(b).map_or(0, crate::gpu::shader::fnv64);
+    PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).entry(*ppv as usize).or_insert((hash(first), second.map_or(0, hash)));
+}
+
 unsafe fn note_console_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         CONSOLE_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
@@ -6381,6 +6391,8 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build_graphics)) {
+            let g = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+            skip_log_name(ppv, &g.VS, Some(&g.PS));
             return hr;
         }
         if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
@@ -6433,6 +6445,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
             LAST_COMPUTE_RS.with(|c| c.set(0));
             note_console_compute(hr, ppv);
+            skip_log_name(ppv, &(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS, None);
             return hr;
         }
         console = translated_compute_pso(this, f, desc, riid, ppv);
@@ -6454,6 +6467,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     note_fallback("compute PSO", hr, hr2 >= 0);
     if console.is_some() {
         note_console_compute(hr2, ppv);
+        skip_log_name(ppv, &(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS, None);
     }
     if hr2 >= 0 {
         hr2

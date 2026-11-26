@@ -1880,6 +1880,10 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         if super::targets::enabled() {
             super::targets::note_draw(this, if super::pso_async::is_pending(pso) { super::targets::STANDIN } else { super::targets::PC });
         }
+        // lab (`XCL_SKIP_LOG`): a draw with a graphics pipeline still being built draws nothing
+        if skip_log() && super::pso_async::is_pending(pso) {
+            skip_note_pso(pso, line!(), "drawn with the stand-in (nothing drawn)");
+        }
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
