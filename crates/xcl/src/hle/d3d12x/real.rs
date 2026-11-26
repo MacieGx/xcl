@@ -1235,6 +1235,20 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
     let r = res.GetDesc();
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
     let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    // lab (`XCL_STENCIL_UINT=1`; the haze investigator's reading): the PC's two stencil view formats
+    // (X32_TYPELESS_G8X24_UINT 22, X24_TYPELESS_G8_UINT 47) are not in the GFX10 table and became
+    // format 0 = the float class: the translated shader then loaded a UINT view as float (undefined
+    // in D3D12). As 8_UINT (5) it takes the uint path.
+    static STENCIL_UINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fmt = if matches!(f.0, 22 | 47) && *STENCIL_UINT.get_or_init(|| std::env::var("XCL_STENCIL_UINT").is_ok_and(|v| v.trim() == "1")) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_info!("lab: stencil view format {} gets the T# format 8_UINT (was {fmt})", f.0);
+        }
+        5
+    } else {
+        fmt
+    };
     let mips = if mips == 0 || mips == u32::MAX { r.MipLevels as u32 } else { mips };
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = match dim {
