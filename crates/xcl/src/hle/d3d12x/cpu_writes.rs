@@ -115,6 +115,8 @@ unsafe fn u64_writable_now(va: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
         return true;
     }
+    // lab: a block guarded for the hot looks is writable (`write_guard`)
+    super::write_guard::unguard(va, 8);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
@@ -147,6 +149,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
         return true;
     }
     crate::hle::kernelx::lazy::ensure(va, bytes);
+    super::write_guard::unguard(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;

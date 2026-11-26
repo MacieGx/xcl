@@ -1149,6 +1149,13 @@ fn hot_looks() -> bool {
 }
 
 const HOT_BLOCK: usize = 2 << 20;
+const _: () = assert!(HOT_BLOCK == super::write_guard::BLOCK);
+
+/// lab: `XCL_WATCH_GUARD=1` with hot looks: a block that goes cold is guarded until its next
+/// write (`write_guard`), so that write makes it hot before a submit can miss it.
+fn watch_guard() -> bool {
+    hot_looks() && super::write_guard::on()
+}
 /// a block nothing was written to for this long is left to the walk again
 const HOT_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1172,9 +1179,16 @@ static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), Atomic
 unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
     start_walk(ranges);
     let now = std::time::Instant::now();
-    let (runs, hot_now): (Vec<(usize, usize)>, usize) = {
+    let guards = watch_guard();
+    let (runs, hot_now, cold): (Vec<(usize, usize)>, usize, Vec<(usize, Vec<(usize, usize)>)>) = {
         let mut g = HOT.lock().unwrap();
         let h = g.get_or_insert_with(HotBlocks::default);
+        // lab (`watch_guard`): blocks a write to a guard made hot since the last look
+        if guards {
+            for b in super::write_guard::take_woken() {
+                h.hot.insert(b, now);
+            }
+        }
         // a block new to the ranges starts hot: memory just mapped is often written and used at once
         if !h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
             let mut known = std::collections::HashSet::with_capacity(h.known.len());
@@ -1191,30 +1205,44 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
             h.known = known;
             h.ranges = Some(Arc::clone(ranges));
         }
+        // lab (`watch_guard`): the blocks that go cold now, to be guarded
+        let going: Vec<usize> = if guards { h.hot.iter().filter(|(_, t)| now.duration_since(**t) >= HOT_FOR).map(|(&b, _)| b).collect() } else { Vec::new() };
         h.hot.retain(|_, t| now.duration_since(*t) < HOT_FOR);
         // the hot blocks as runs, each inside one range (a write-watch call covers one allocation)
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for (&b, _) in h.hot.iter() {
-            let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
-            while let Some(&(base, size)) = ranges.get(j) {
-                if base >= b + HOT_BLOCK {
-                    break;
-                }
-                let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
-                if lo < hi {
-                    match runs.last_mut() {
-                        Some(last) if last.0 + last.1 == lo && lo > base => last.1 += hi - lo,
-                        _ => runs.push((lo, hi - lo)),
-                    }
-                }
-                j += 1;
-            }
+            block_runs(ranges, b, &mut runs);
         }
-        (runs, h.hot.len())
+        let cold = going
+            .into_iter()
+            .map(|b| {
+                let mut r = Vec::new();
+                block_runs(ranges, b, &mut r);
+                (b, r)
+            })
+            .collect();
+        (runs, h.hot.len(), cold)
     };
     let first = dirty.len();
     for &(base, size) in &runs {
         take_written(base, size, buf, dirty, page);
+    }
+    // lab (`watch_guard`): a block going cold is guarded, then its pages written before the
+    // guard are taken (one written already is given back at once: it is hot again)
+    let first_cold = dirty.len();
+    for (b, r) in &cold {
+        super::write_guard::guard(*b, r);
+        for &(base, size) in r {
+            take_written(base, size, buf, dirty, page);
+        }
+    }
+    let mut last = usize::MAX;
+    for &p in &dirty[first_cold..] {
+        let b = p & !(HOT_BLOCK - 1);
+        if b != last {
+            super::write_guard::walk_found(b);
+            last = b;
+        }
     }
     if dirty.len() > first {
         let mut g = HOT.lock().unwrap();
@@ -1243,6 +1271,28 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
             ranges.len(),
             HOT_STATS[3].load(Ordering::Relaxed)
         );
+        if guards {
+            crate::xlog_info!("D3D12.X: {}", super::write_guard::stats());
+        }
+    }
+}
+
+/// The parts of block `b` inside `ranges` (sorted, disjoint) appended to `runs`, each inside one
+/// range, and joined to the run before when they follow it in the same range.
+fn block_runs(ranges: &[(usize, usize)], b: usize, runs: &mut Vec<(usize, usize)>) {
+    let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
+    while let Some(&(base, size)) = ranges.get(j) {
+        if base >= b + HOT_BLOCK {
+            break;
+        }
+        let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
+        if lo < hi {
+            match runs.last_mut() {
+                Some(last) if last.0 + last.1 == lo && lo > base => last.1 += hi - lo,
+                _ => runs.push((lo, hi - lo)),
+            }
+        }
+        j += 1;
     }
 }
 
@@ -1301,6 +1351,12 @@ unsafe fn walk() {
                     from = (buf[n - 1] as usize & !(HOT_BLOCK - 1)) + HOT_BLOCK;
                 }
                 if !found.is_empty() {
+                    // lab (`watch_guard`): a guarded block written without a fault is given back
+                    if watch_guard() {
+                        for &b in &found {
+                            super::write_guard::walk_found(b);
+                        }
+                    }
                     let now = std::time::Instant::now();
                     let mut g = HOT.lock().unwrap();
                     let h = g.get_or_insert_with(HotBlocks::default);

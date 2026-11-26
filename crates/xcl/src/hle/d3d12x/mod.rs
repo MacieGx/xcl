@@ -39,6 +39,7 @@ pub mod title_list;
 pub mod view_mem;
 mod submit_cost;
 pub mod title_textures;
+pub(crate) mod write_guard;
 pub mod vram;
 mod worker_pool;
 
