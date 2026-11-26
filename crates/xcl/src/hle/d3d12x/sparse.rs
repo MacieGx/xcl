@@ -3178,6 +3178,10 @@ mod tests {
             s.release_if_unused(at, tile);
             assert!(s.kept.is_empty() && !s.free.contains(&tile));
             assert!(s.flush_parked());
+            // (main's quarantine: free once the unmap is done on the sparse queue)
+            assert!(!s.free.contains(&tile));
+            s.wait_for(s.value);
+            assert!(s.drain_quarantined());
             assert!(s.free.contains(&tile));
 
             s.wait_for(s.value);
