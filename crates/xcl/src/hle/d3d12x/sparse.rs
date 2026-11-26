@@ -1695,6 +1695,11 @@ pub unsafe fn place_buffer_when(this: *mut c_void, va: usize, desc: &D3D12_RESOU
 /// what `use_range` checks before it takes the state's lock
 static LAZY_BOUNDS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
+/// Whether a placed buffer waits for its tiles (`use_range` has something to do).
+pub fn lazy_pending() -> bool {
+    LAZY_BOUNDS[1].load(Ordering::Acquire) != 0
+}
+
 fn publish_lazy_bounds(s: &State) {
     let (lo, hi) = s.lazy_bounds();
     LAZY_BOUNDS[0].store(lo, Ordering::Release);
