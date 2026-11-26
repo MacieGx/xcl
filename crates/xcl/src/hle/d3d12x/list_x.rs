@@ -1149,6 +1149,41 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Lab (`XCL_SYNC_TRACE=1`, after upstream's local diagnostic 2570d0a4): the last sync events in
+/// the order XCL made them, logged at the first three cycle breaks.
+static SYNC_TRACE: Mutex<std::collections::VecDeque<(u64, String)>> = Mutex::new(std::collections::VecDeque::new());
+
+fn sync_trace_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_SYNC_TRACE").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+fn sync_trace(what: impl FnOnce() -> String) {
+    if !sync_trace_on() {
+        return;
+    }
+    static T0: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let t = T0.elapsed().as_micros() as u64;
+    let w = what();
+    let mut g = SYNC_TRACE.lock().unwrap();
+    if g.len() >= 1500 {
+        g.pop_front();
+    }
+    g.push_back((t, w));
+}
+
+fn dump_sync_trace(why: &str, n: &AtomicU64, times: u64) {
+    if !sync_trace_on() || n.fetch_add(1, Ordering::Relaxed) >= times {
+        return;
+    }
+    let g = SYNC_TRACE.lock().unwrap();
+    let last = g.back().map_or(0, |e| e.0);
+    crate::xlog_warn!("SYNC TRACE ({why}): {} events, the last at 0:", g.len());
+    for (t, w) in g.iter() {
+        crate::xlog_warn!("SYNC {:>9.3} {w}", (*t as f64 - last as f64) / 1000.0);
+    }
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1712,6 +1747,18 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        sync_trace(|| {
+            let how = match &action {
+                SignalAction::Skip => "nobody needs it".to_string(),
+                SignalAction::GpuSignal => "SIGNAL".to_string(),
+                SignalAction::CpuCycleBreak(w) => format!("CYCLE - signalled on the CPU, waiters {:?}", w.iter().map(|x| (queue_id(x.0), x.1)).collect::<Vec<_>>()),
+            };
+            format!("q{} signal {va:#x} = {val:#x}: {how}", queue_id(sig_q))
+        });
+        if matches!(action, SignalAction::CpuCycleBreak(_)) {
+            static DUMPS: AtomicU64 = AtomicU64::new(0);
+            dump_sync_trace("cycle break", &DUMPS, 3);
+        }
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -1808,11 +1855,13 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     // Already released on CPU (cycle break or watchdog): never re-arm a GPU wait that could
     // observe a vkd3d-proton fence rewind.
     if cpu_sig_max >= w.value {
+        sync_trace(|| format!("q{} wait {:#x} >= {:#x}: released on the CPU before", queue_id(q_raw), w.va, w.value));
         return GpuWaitOutcome::Handled;
     }
     // Producer already submitted earlier on THIS EXACT queue: D3D12 FIFO executes it strictly
     // before this list without needing a CPU wait or redundant queue.Wait.
     if sub_max >= w.value && sub_q == Some(q_raw) {
+        sync_trace(|| format!("q{} wait {:#x} >= {:#x}: this queue signals {sub_max:#x} before", queue_id(q_raw), w.va, w.value));
         return GpuWaitOutcome::Handled;
     }
     // Same-batch self-wait: this very submission writes `(w.va, >= w.value)`, so hoisting a GPU
@@ -1904,6 +1953,17 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
+    sync_trace(|| {
+        format!(
+            "q{}@{wait_seq} WAIT {:#x} >= {:#x} (submitted {sub_max:#x} by {:?}{}{})",
+            queue_id(q_raw),
+            w.va,
+            w.value,
+            sub_q.map(queue_id),
+            if unsubmitted { ", not signalled yet" } else { "" },
+            if w.after_write64 { ", after a Write64 of its list" } else { "" }
+        )
+    });
 
     if let Err(e) = q.Wait(&fence, w.value) {
         let mut g = SYNC_GRAPH.lock().unwrap();
@@ -1965,12 +2025,14 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
     for w in waits {
         if w.is_satisfied() {
+            sync_trace(|| format!("q{} wait {:#x} >= {:#x}: memory holds it", queue_id(queue as usize), w.va, w.value));
             continue;
         }
         match try_gpu_wait(queue, w, list_writes) {
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
+        sync_trace(|| format!("q{} wait {:#x} (op {}) {:#x}: on the CPU", queue_id(queue as usize), w.va, w.comparison, w.value));
         if !wait_or_bridge(queue, w, list_writes, timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
@@ -2058,18 +2120,34 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             })
             .collect()
     };
+    sync_trace(|| {
+        let rows: Vec<String> = lists
+            .iter()
+            .zip(&per_list)
+            .map(|(l, (w, x))| {
+                let wrapper = super::title_list::wrapper_of(*l).map_or(0, |p| p as usize) & 0xFFFFF;
+                let waits: Vec<String> =
+                    w.iter().map(|p| format!("W{:x}>={:x}{}{}", p.va & 0xFFF, p.value, if p.after_write64 { "!" } else { "" }, if p.is_satisfied() { "ok" } else { "" })).collect();
+                let writes: Vec<String> = x.iter().map(|p| format!("S{:x}={:x}", p.0 & 0xFFF, p.1)).collect();
+                format!("{:x}/{wrapper:x}[{} | {}]", *l as usize & 0xFFFFF, waits.join(" "), writes.join(" "))
+            })
+            .collect();
+        format!("q{} EXECUTE {} lists: {}", queue_id(queue as usize), lists.len(), rows.join(" "))
+    });
     let mut start = 0usize;
     for (i, (waits, list_writes)) in per_list.iter().enumerate() {
         if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
+            sync_trace(|| format!("q{} submit lists {start}..{i}", queue_id(queue as usize)));
             submit(&lists[start..i]);
         }
         wait_all_on(queue, waits, list_writes);
         start = i;
     }
     if start < lists.len() {
+        sync_trace(|| format!("q{} submit lists {start}..{}", queue_id(queue as usize), lists.len()));
         submit(&lists[start..]);
     }
 }
@@ -2825,6 +2903,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         true
     };
     let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
+    sync_trace(|| format!("record: list {:x} wait {va:#x} >= {value:#x} after a Write64: {}", list as usize & 0xFFFFF, if target == list { "NOT split" } else { "split" }));
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
