@@ -1400,6 +1400,26 @@ unsafe fn fresh_indirect_arguments(list: *mut c_void, op: impl FnOnce()) {
     super::list_x::transition(list, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
 }
 
+/// lab (`XCL_CLAMP_ORDER=0`: off): the same wait for a dispatch of XCL's own that READS the
+/// arguments - `indirect_clamp` bounds a record in a compute pass before the call, and that pass
+/// came before the transition above: it read the count while the title's passes were still
+/// writing it (runs Q4 / Q5, "ei pair": the final gather's [97776, 1, 1] bounded to [174, 1, 1],
+/// other programs' records bounded to MORE than they held), so the call ran a stale count.
+pub(super) unsafe fn wait_for_argument_writes(list: &ID3D12GraphicsCommandList) {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_CLAMP_ORDER").is_ok_and(|v| v.trim() == "0")) {
+        return;
+    }
+    let raw = list.as_raw();
+    if !super::list_x::tracked_list_type(raw).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        return;
+    }
+    let Some(buffer) = argument_order_buffer(list) else { return };
+    let b = buffer.as_raw() as usize;
+    super::list_x::transition(raw, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    super::list_x::transition(raw, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+}
+
 /// The device's buffer for `fresh_indirect_arguments` (made on first use)
 unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D12Resource> {
     let mut dev: Option<ID3D12Device> = None;

@@ -418,6 +418,8 @@ pub(super) unsafe fn bound_within(
     let cfg = config(s, max, source_at, count_at, budget);
     // the title's writes to its records (through any view) before our reads
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }]);
+    // lab: and the driver's wait for them (`bind::fresh_indirect_arguments` has it for the call itself)
+    super::bind::wait_for_argument_writes(list);
     list.SetPipelineState(&c.pso);
     list.SetComputeRootSignature(&c.root);
     list.SetComputeRootUnorderedAccessView(0, source);
@@ -426,6 +428,9 @@ pub(super) unsafe fn bound_within(
     list.SetComputeRoot32BitConstants(3, CONFIG_WORDS, cfg.as_ptr().cast(), 0);
     list.Dispatch(1, 1, 1);
     transition(list, &out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    // lab: and for the bounded record's own bytes (run Q6, fresh bytes for every call: a copy made
+    // right after this read [0, 0, 0] for 370 of 375 records and [2657, 0, 0] for [2657, 1, 1])
+    super::bind::wait_for_argument_writes(list);
     Some(Bounded(out, out_at))
 }
 
