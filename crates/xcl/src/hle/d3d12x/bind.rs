@@ -909,6 +909,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         if compute && !gfx {
             pass_snap(this, pso);
+            pass_fill(this, pso);
         }
     }
     if let Some(b) = bounded {
@@ -2344,7 +2345,68 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         super::list_x::depth_twin_flush(this, res, plane);
     }
     pass_snap(this, pso);
+    pass_fill(this, pso);
     Ok(())
+}
+
+/// lab: `XCL_PASS_FILL=<cs record hash>:t<i>[<slot>][=<hex dword>]:...,<hash>:...` - right after
+/// every dispatch of a named compute program, the textures in the named slots of its descriptor
+/// tables (numbered as the dispatch probe and the pass snapshots print them) are filled with the
+/// dword (default 0 = cleared). To take a pass's output out of the frame (its garbage with it),
+/// or to put a constant in its place (an R9G9B9E5 / R11G11B10 value as hex).
+unsafe fn pass_fill(this: *mut c_void, pso: usize) {
+    static SET: std::sync::OnceLock<Vec<(u64, Vec<(usize, usize, u32)>)>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        std::env::var("XCL_PASS_FILL")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let mut f = e.trim().split(':');
+                let cs = u64::from_str_radix(f.next()?.trim(), 16).ok()?;
+                let slots = f
+                    .filter_map(|s| {
+                        let (slot, pat) = s.split_once('=').map_or((s, 0), |(a, b)| (a, u32::from_str_radix(b.trim(), 16).unwrap_or(0)));
+                        let (t, k) = slot.trim().strip_prefix('t')?.strip_suffix(']')?.split_once('[')?;
+                        Some((t.parse().ok()?, k.parse().ok()?, pat))
+                    })
+                    .collect();
+                Some((cs, slots))
+            })
+            .collect()
+    });
+    if set.is_empty() {
+        return;
+    }
+    let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
+    let Some((_, slots)) = set.iter().find(|e| e.0 == cs) else { return };
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let tables: Vec<usize> = layout
+        .params
+        .iter()
+        .filter_map(|p| match *p {
+            Param::Table { at } => word(at as usize).filter(|&v| v != 0).map(|v| u.base() + v as usize),
+            _ => None,
+        })
+        .collect();
+    let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+    for &(ti, k, pat) in slots {
+        let Some(&t) = tables.get(ti) else { continue };
+        let slot = t + 32 * k;
+        if !crate::gpu::shader::readable(slot, 32) {
+            continue;
+        }
+        let w0 = (slot as *const u32).read_unaligned();
+        let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
+        let done = r.filter(|&r| alive(r)).is_some_and(|r| super::list_x::pass_fill(this, r, pat));
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 24 || n.is_power_of_two() {
+            crate::xlog_info!("pass fill #{n}: cs {cs:016x} t{ti}[{k}] {:#x} with {pat:#010x} at {:.1} s: {}", r.unwrap_or(0), crate::log::uptime(), if done { "done" } else { "NOT done" });
+        }
+    }
 }
 
 /// lab: `XCL_PASS_SNAP=<cs record hash>,...` (hex; with `XCL_RT_DUMP`) - what the large targets a

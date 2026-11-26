@@ -2366,6 +2366,34 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
     Some(raw)
 }
 
+/// lab (`XCL_PASS_FILL`, `bind::pass_fill`): mip 0 of the texture `res` holds the 32-bit `pattern`
+/// in every dword from this point of the list on (0: cleared). Copied from a pattern buffer; the
+/// texture is written in whatever state it is in, as the alias copies do.
+pub(super) unsafe fn pass_fill(list: *mut c_void, res: usize, pattern: u32) -> bool {
+    let r = res as *mut c_void;
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return false };
+    let Some(dev) = device_of(list) else { return false };
+    let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0u64;
+    dev.GetCopyableFootprints(&d, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+    if total == 0 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 {
+        return false;
+    }
+    let mut pat = [0u8; 16];
+    for c in pat.chunks_exact_mut(4) {
+        c.copy_from_slice(&pattern.to_le_bytes());
+    }
+    let Some(buf) = pattern_buffer(list, pat, total) else { return false };
+    let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
+    let dl = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+    let sl = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&buf), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, &dl, 0, 0, 0, &sl, std::ptr::null());
+    std::mem::forget((dl, sl));
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
+    true
+}
+
 unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     if size == 0 || !size.is_multiple_of(unit) || size > MAX_FILL {
