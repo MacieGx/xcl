@@ -4637,10 +4637,12 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
         }
         return;
     }
-    // lab (`XCL_SRGB_TWIN`): a render target whose state no barrier has told us yet is left alone
-    if info.target && super::depth_twin::state_known(res, info.first).is_none() {
+    // lab (`XCL_SRGB_TWIN`): a render target whose state is not known is left alone
+    if super::depth_twin::copy_state(&info, res, info.first).is_none() {
+        super::depth_twin::note_use(&info, res, plane, "flush skipped (no barrier has named the target)");
         return;
     }
+    super::depth_twin::note_use(&info, res, plane, "flush");
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     let barrier = |r: usize, sub: u32, before: u32, after: u32| {
         if before != after {
@@ -4661,7 +4663,7 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
     let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
     barrier(info.twin, ALL, UA, COPY_SOURCE);
-    let states: Vec<u32> = (0..info.subs).map(|k| super::depth_twin::state(res, info.first + k)).collect();
+    let states: Vec<u32> = (0..info.subs).map(|k| super::depth_twin::copy_state(&info, res, info.first + k).unwrap_or(0x10)).collect();
     if n <= 12 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: depth twin flush #{n}: {res:#x} plane {plane}, {} subresources from {}, in state {:#x}", info.subs, info.first, states[0]);
     }
@@ -4737,9 +4739,11 @@ pub(super) unsafe fn depth_twin_fill(list: *mut c_void, res: usize, plane: u32) 
     if tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         return;
     }
-    if info.target && super::depth_twin::state_known(res, info.first).is_none() {
+    let Some(state) = super::depth_twin::copy_state(&info, res, info.first) else {
+        super::depth_twin::note_use(&info, res, plane, "fill skipped (no barrier has named the target)");
         return;
-    }
+    };
+    super::depth_twin::note_use(&info, res, plane, "fill");
     let barrier = |r: usize, sub: u32, before: u32, after: u32| {
         if before != after {
             let b: [u32; 8] = [0, 0, r as u32, (r as u64 >> 32) as u32, sub, before, after, 0];
@@ -4752,7 +4756,6 @@ pub(super) unsafe fn depth_twin_fill(list: *mut c_void, res: usize, plane: u32) 
     let sub_of = |r: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
     let placed = |r: usize, fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
     const ALL: u32 = u32::MAX;
-    let state = super::depth_twin::state(res, info.first);
     barrier(res, info.first, state, 0x800);
     let (d, s) = (placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_plane }), sub_of(res, info.first));
     copy(&d, &s);

@@ -82,10 +82,43 @@ fn plane0_bits() -> u32 {
     *M.get_or_init(|| std::env::var("XCL_DEPTH_TWIN_PLANE0").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
 }
 
-/// lab (`XCL_SRGB_TWIN=1`): twins for the UNORM UAVs of sRGB render targets.
+/// lab (`XCL_SRGB_TWIN`): twins for the UNORM UAVs of sRGB render targets. 1: copied only once a
+/// barrier of the title has told the target's state; 2: a target no barrier has named is taken to
+/// be in RENDER_TARGET (the retail title names none of its twinned resources in a barrier).
+fn srgb_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("XCL_SRGB_TWIN").ok().and_then(|v| v.trim().parse().ok()).filter(|m| *m <= 2).unwrap_or(0))
+}
+
 fn srgb_on() -> bool {
-    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("XCL_SRGB_TWIN").is_ok_and(|v| v.trim() == "1"))
+    srgb_mode() != 0
+}
+
+/// The state of a render target with a twin for the copies around a dispatch: what a barrier
+/// left (`known`), else RENDER_TARGET in mode 2, else None (the copies are not made).
+fn target_state_from(known: Option<u32>, mode: u8) -> Option<u32> {
+    known.or(if mode == 2 { Some(0x4) } else { None })
+}
+
+/// The PC state subresource `sub` of `res` is in for the copies between it and its twin (None: a
+/// render target whose state is not known - no copies).
+pub fn copy_state(info: &Info, res: usize, sub: u32) -> Option<u32> {
+    if info.target { target_state_from(state_known(res, sub), srgb_mode()) } else { Some(state(res, sub)) }
+}
+
+/// lab: the first three times each thing happens to the lab's own twins (the depth of a D32S8
+/// buffer, an sRGB target): which dispatches name them and whether the copies were made.
+pub fn note_use(info: &Info, res: usize, plane: u32, what: &'static str) {
+    if !info.copy_in {
+        return;
+    }
+    static SEEN: Mutex<Option<HashMap<(usize, u32, &'static str), u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap();
+    let n = g.get_or_insert_with(HashMap::new).entry((res, plane, what)).or_insert(0);
+    *n += 1;
+    if *n <= 3 {
+        crate::xlog_info!("lab: twin use: {what} #{n} of {res:#x} plane {plane} ({}x{}, {}) at {:.1} s", info.fp_twin.Footprint.Width, info.fp_twin.Footprint.Height, if info.target { "sRGB target" } else { "D32S8 depth" }, crate::log::uptime());
+    }
 }
 
 /// The plane and the twin's format for a UAV in `view` (the PC's format) of a resource in
@@ -552,6 +585,14 @@ mod tests {
         assert_eq!(state_known(res, 0), Some(0x4));
         set_state(res, 0, 0x80);
         assert_eq!((state_known(res, 0), state_known(res, 1)), (Some(0x80), Some(0x4)));
+    }
+
+    #[test]
+    fn a_target_no_barrier_named_is_copied_only_in_mode_2() {
+        assert_eq!(target_state_from(None, 1), None);
+        assert_eq!(target_state_from(None, 2), Some(0x4), "taken to be in RENDER_TARGET");
+        assert_eq!(target_state_from(Some(0x80), 1), Some(0x80));
+        assert_eq!(target_state_from(Some(0x80), 2), Some(0x80), "a barrier's state comes first");
     }
 
     #[test]

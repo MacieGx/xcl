@@ -2701,8 +2701,10 @@ unsafe fn depth_twins_named(this: *mut c_void) -> Vec<(usize, u32)> {
             if let Some(x) = super::depth_twin::by_word0(d[0]) {
                 if !out.contains(&x) {
                     out.push(x);
+                    // (alias pairs, plane 2, are named all the time: the others have their own lines)
                     static N: AtomicU64 = AtomicU64::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                    static OTHER: AtomicU64 = AtomicU64::new(0);
+                    if (if x.1 == 2 { &N } else { &OTHER }).fetch_add(1, Ordering::Relaxed) < 40 {
                         let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
                         crate::xlog_info!("lab: depth twin view of {:#x} plane {} in slot {k} of a table of cs {cs:016x} at {:.1} s", x.0, x.1, crate::log::uptime());
                     }
