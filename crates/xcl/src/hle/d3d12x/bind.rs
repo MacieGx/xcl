@@ -182,6 +182,48 @@ pub(super) fn want_bound(this: *mut c_void) {
     super::pso_async::want(with(this, |s| s.pso));
 }
 
+/// lab (`XCL_SKIP_LOG=1`): one line the first time a pipeline's draw or dispatch is skipped at
+/// a place in this file (the source line), with its console shaders' hashes when they are known
+/// and the uptime: which programs a run lost at world entry, to compare between runs.
+pub(super) fn skip_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SKIP_LOG").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn skip_note(this: *mut c_void, line: u32) {
+    if !skip_log() {
+        return;
+    }
+    let pso = with(this, |s| s.pso);
+    skip_note_pso(pso, line, "skipped");
+}
+
+/// A call of the list's bound pipeline was put off to the submit (`list_x::defer`).
+pub(super) fn skip_note_put_off(this: *mut c_void) {
+    if skip_log() {
+        skip_note_pso(with(this, |s| s.pso), line!(), "put off to the submit");
+    }
+}
+
+/// [`skip_note`] for a pipeline by itself (`what`: skipped, put off).
+pub(super) fn skip_note_pso(pso: usize, line: u32, what: &str) {
+    if !skip_log() {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u64, u64, usize, u32)>>> = std::sync::Mutex::new(None);
+    let shaders = super::real::pso_shaders(pso);
+    let key = shaders.map_or((0, 0, pso, line), |(a, b)| (a, b, 0, line));
+    if !SEEN.lock().unwrap().get_or_insert_with(Default::default).insert(key) {
+        return;
+    }
+    let (a, b) = shaders.unwrap_or((0, 0));
+    crate::xlog_info!(
+        "lab: skip log: {what} first at line {line}: pipeline {pso:#x} shaders {a:016x} {b:016x}{} at {:.1} s",
+        if super::pso_async::is_pending(pso) { " (still being built)" } else { "" },
+        crate::log::uptime()
+    );
+}
+
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
@@ -708,6 +750,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 }
                 Err(e) => {
                     super::targets::note_draw(this, super::targets::SKIPPED);
+                    skip_note(this, line!());
                     count(DRAWS_SKIPPED);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -763,6 +806,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             Err(e) => {
                 super::targets::note_draw(this, super::targets::SKIPPED);
+                skip_note(this, line!());
                 count(DRAWS_SKIPPED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -774,6 +818,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     }
     if super::pso_async::is_pending(raw_pso) {
         super::targets::note_draw(this, super::targets::STANDIN);
+        skip_note(this, line!());
         count(DRAWS_SKIPPED);
         return;
     }
@@ -835,6 +880,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if bounded.is_none() && !unbounded {
                 // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
                 ei_work(this, sig, super::targets::SKIPPED);
+                skip_note(this, line!());
                 count(DRAWS_SKIPPED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -944,6 +990,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 Err(e) => {
                     ei_work(this, sig, super::targets::SKIPPED);
+                    skip_note(this, line!());
                     count(DRAWS_SKIPPED);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -963,6 +1010,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(raw_pso) {
             ei_work(this, sig, super::targets::STANDIN);
+            skip_note(this, line!());
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -975,6 +1023,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(pso) {
+            skip_note(this, line!());
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -993,6 +1042,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // the driver pipeline `resolve_wait` returned.)
         if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
         super::targets::note_dispatch();
+            skip_note(this, line!());
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1122,6 +1172,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     if let Err(e) = result {
         ei_work(this, sig, super::targets::SKIPPED);
+        skip_note(this, line!());
         count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1834,6 +1885,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
+            skip_note(this, line!());
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1886,6 +1938,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         Err(e) => {
             super::targets::note_draw(this, super::targets::SKIPPED);
             super::list_x::note_dropped_draw(this);
+            skip_note(this, line!());
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -2208,6 +2261,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
+        skip_note(this, line!());
         count(DISPATCHES_SKIPPED);
         return;
     }
@@ -2216,6 +2270,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
         }
+        skip_note(this, line!());
         count(DISPATCHES_SKIPPED);
         return;
     };
@@ -2233,6 +2288,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
+            skip_note(this, line!());
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {

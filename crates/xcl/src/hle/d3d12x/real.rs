@@ -5957,8 +5957,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-    // lab: `XCL_GPU_PROFILE` names draws by their console shaders
-    if super::gpu_profile::on() {
+    // lab: `XCL_GPU_PROFILE` names draws by their console shaders (`XCL_SKIP_LOG`: skipped ones)
+    if super::gpu_profile::on() || super::bind::skip_log() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
     }

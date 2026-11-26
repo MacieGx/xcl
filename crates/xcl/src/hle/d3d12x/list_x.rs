@@ -2923,6 +2923,7 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
     if split(list, Some(what)).is_none() {
         return false;
     }
+    super::bind::skip_note_put_off(list);
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
