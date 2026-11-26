@@ -1014,7 +1014,8 @@ pub fn rt_dump_on() -> bool {
 /// lab: the next dump is due within a second (or already due)
 pub fn rt_dump_due_soon() -> bool {
     let done = RT_DUMPS_DONE.load(Ordering::Relaxed) as usize;
-    rt_dump_times().get(done).is_some_and(|&t| crate::log::uptime() >= t - 1.0)
+    // (3 s: with a present every 1.5-2 s a second was too short - O5's gameplay set was taken by no pass)
+    rt_dump_times().get(done).is_some_and(|&t| crate::log::uptime() >= t - 3.0)
 }
 
 /// (resource, kind) in first-use order, AddRef'd until the next present
