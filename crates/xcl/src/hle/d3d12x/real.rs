@@ -1439,7 +1439,9 @@ static OUTSIDE_BUFFERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new(
 /// sparse windows (no CPU pages): its V# names that address. `XCL_OUTSIDE_BUFFERS=1`: on (off by default: w58).
 pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("XCL_OUTSIDE_BUFFERS").is_ok_and(|v| v.trim() == "1")) {
+    // lab tree: ON unless `XCL_OUTSIDE_BUFFERS=0`. It was opt-in, and every env after section 33 of the
+    // lab notes lost the variable: a night of runs had empty light / ray / tile lists (run O2).
+    if !*ON.get_or_init(|| !std::env::var("XCL_OUTSIDE_BUFFERS").is_ok_and(|v| v.trim() == "0")) {
         return None;
     }
     let u = crate::gpu::uma::get()?;
