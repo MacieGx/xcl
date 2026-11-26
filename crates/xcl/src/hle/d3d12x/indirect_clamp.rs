@@ -234,6 +234,15 @@ unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<(I
 /// The GPU is done with what lists recorded from `allocator` (reset or released): its copies
 /// can be reused.
 pub(super) fn allocator_reset(allocator: usize) {
+    // lab (`XCL_CLAMP_KEEP=1`): nothing is given back - every call keeps bytes of its own for the
+    // whole run (~0.5 MB a second in a retail title's world). The test for: a bounded record that
+    // holds ANOTHER call's values (run Q4 / Q5 "ei pair": [97776, 1, 1] -> [174, 1, 1], also with
+    // more groups than the title asked for) because its bytes were handed to a later recording
+    // while the GPU had not run the earlier one.
+    static KEEP: OnceLock<bool> = OnceLock::new();
+    if *KEEP.get_or_init(|| std::env::var("XCL_CLAMP_KEEP").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
     // the buffers over `FREE_KEPT` are released after the lock: a buffer's last Release takes
     // the sparse state's lock (`real::res_release` → `sparse::forget_buffer`), and a thread
     // holding that one resets an allocator (`sparse::readback_after_execute`) and comes here –
