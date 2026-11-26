@@ -321,6 +321,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // lab: `XCL_SAMPLE=<from s>,<seconds>[,<ms>]` – a sampling profile of every thread (`eh::sample_profile`)
+    if let Ok(v) = std::env::var("XCL_SAMPLE") {
+        let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if p.len() >= 2 {
+            let file = std::env::var_os("XCL_SAMPLE_FILE").map_or_else(|| std::env::temp_dir().join("xcl-profile.txt"), std::path::PathBuf::from);
+            let every = p.get(2).map_or(10, |&m| (m as u64).max(1));
+            let _ = std::thread::Builder::new().name("xcl-sample".into()).spawn(move || crate::eh::sample_profile(p[0], p[1], every, file));
+        }
+    }
     // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
     // report written (a process killed from outside with GPU work in flight can hang in the driver)
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {

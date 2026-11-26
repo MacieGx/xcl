@@ -970,6 +970,184 @@ pub fn start_probes() {
     });
 }
 
+#[link(name = "dbghelp")]
+extern "system" {
+    fn SymInitializeW(process: *mut c_void, path: *const u16, invade: i32) -> i32;
+    fn SymSetOptions(options: u32) -> u32;
+    fn SymFromAddrW(process: *mut c_void, address: u64, displacement: *mut u64, symbol: *mut SymbolInfoW) -> i32;
+}
+
+/// dbghelp's SYMBOL_INFOW with room for the name
+#[repr(C)]
+struct SymbolInfoW {
+    size_of_struct: u32,
+    type_index: u32,
+    reserved: [u64; 2],
+    index: u32,
+    size: u32,
+    mod_base: u64,
+    flags: u32,
+    value: u64,
+    address: u64,
+    register: u32,
+    scope: u32,
+    tag: u32,
+    name_len: u32,
+    max_name_len: u32,
+    name: [u16; 400],
+}
+
+/// Lab (`XCL_SAMPLE=<from s>,<seconds>[,<ms>]`, `XCL_SAMPLE_FILE=<path>`): a sampling profile of
+/// the whole process without a debugger or ETW. Every `ms` (10) each thread is stopped for its
+/// registers, as `dump_threads` does, and its stack is unwound after it runs again (the leaf is
+/// exact; callers of a running thread can be off). At the end the file gets each thread's CPU time
+/// in the window (`GetThreadTimes`) and the stacks by count, outermost first, with names from
+/// the symbols (`<thread>;<frame>;...;<leaf> <samples>`).
+pub fn sample_profile(from: f64, seconds: f64, every_ms: u64, file: std::path::PathBuf) {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadTimes, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+    let left = from - crate::log::uptime();
+    if left > 0.0 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(left));
+    }
+    unsafe {
+        let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+        let threads = || {
+            let mut out = Vec::new();
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut te) != 0;
+            while ok {
+                if te.th32OwnerProcessID == pid && te.th32ThreadID != me {
+                    out.push(te.th32ThreadID);
+                }
+                ok = Thread32Next(snap, &mut te) != 0;
+            }
+            CloseHandle(snap);
+            out
+        };
+        let cpu_100ns = |h: *mut c_void| {
+            let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+            if GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) == 0 {
+                return (0u64, 0u64);
+            }
+            let v = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+            (v(k), v(u))
+        };
+        // tid -> (handle, name, kernel and user time at its first sample)
+        let mut known: std::collections::HashMap<u32, (usize, String, (u64, u64))> = std::collections::HashMap::new();
+        let mut stacks: std::collections::HashMap<(u32, Vec<usize>), u32> = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        let mut ticks = 0u64;
+        let mut list = threads();
+        crate::xlog_info!("sample profile: {} threads, every {every_ms} ms for {seconds} s, at {:.1} s", list.len(), crate::log::uptime());
+        while t0.elapsed().as_secs_f64() < seconds {
+            if ticks % 100 == 99 {
+                list = threads();
+            }
+            ticks += 1;
+            for &tid in &list {
+                let h = match known.get(&tid) {
+                    Some(k) => k.0 as *mut c_void,
+                    None => {
+                        let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
+                        if h.is_null() {
+                            continue;
+                        }
+                        known.insert(tid, (h as usize, thread_name(h), cpu_100ns(h)));
+                        h
+                    }
+                };
+                #[repr(align(16))]
+                struct Aligned(CONTEXT);
+                let mut c: Aligned = std::mem::zeroed();
+                c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+                let got = SuspendThread(h) != u32::MAX && {
+                    let ok = GetThreadContext(h, &mut c.0) != 0;
+                    ResumeThread(h);
+                    ok
+                };
+                if got {
+                    *stacks.entry((tid, unwind(&mut c.0, 28))).or_insert(0) += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(every_ms));
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let mut out = format!("# sample profile: {ticks} ticks in {wall:.2} s from {from} s, every {every_ms} ms; {} threads\n", known.len());
+        let mut cpu: Vec<(u64, u64, u32, String)> = known
+            .iter()
+            .map(|(&tid, (h, name, was))| {
+                let now = cpu_100ns(*h as *mut c_void);
+                (now.0.saturating_sub(was.0) / 10_000, now.1.saturating_sub(was.1) / 10_000, tid, name.clone())
+            })
+            .collect();
+        cpu.sort_by_key(|c| std::cmp::Reverse(c.0 + c.1));
+        for (k, u, tid, name) in &cpu {
+            if k + u > 0 {
+                out += &format!("# cpu {tid} '{name}': kernel {k} ms, user {u} ms\n");
+            }
+        }
+        // names: dbghelp for the modules the loader knows (xcl.exe with its PDB, system DLLs by
+        // their exports), module + offset for the title's images
+        let process = GetCurrentProcess();
+        SymSetOptions(0x2 | 0x4 | 0x10);
+        let have_syms = SymInitializeW(process, std::ptr::null(), 1) != 0;
+        let mut names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut name_of = |a: usize| -> String {
+            names
+                .entry(a)
+                .or_insert_with(|| {
+                    let plain = modules::describe_address(a).replace(';', ":").replace(' ', "_");
+                    if have_syms && modules::image_base_for_addr(a).is_none() {
+                        let mut sym: SymbolInfoW = std::mem::zeroed();
+                        sym.size_of_struct = 88;
+                        sym.max_name_len = 399;
+                        let mut disp = 0u64;
+                        if SymFromAddrW(process, a as u64, &mut disp, &mut sym) != 0 {
+                            let n = (sym.name_len as usize).min(399);
+                            let module = plain.split('+').next().unwrap_or("");
+                            let module = module.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
+                            return format!("{module}!{}", String::from_utf16_lossy(&sym.name[..n]).replace(';', ":").replace(' ', "_"));
+                        }
+                    }
+                    plain
+                })
+                .clone()
+        };
+        let mut rows: Vec<(u32, String)> = stacks
+            .into_iter()
+            .map(|((tid, frames), n)| {
+                let who = known.get(&tid).map_or(String::new(), |k| k.1.clone());
+                let mut line = format!("{tid}'{}'", who.replace(';', ":").replace(' ', "_"));
+                for &a in frames.iter().rev() {
+                    line.push(';');
+                    line += &name_of(a);
+                }
+                (n, line)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        for (n, line) in rows {
+            out += &format!("{line} {n}\n");
+        }
+        for (h, _, _) in known.values() {
+            CloseHandle(*h as *mut c_void);
+        }
+        let ok = std::fs::write(&file, out).is_ok();
+        crate::xlog_info!("sample profile: {ticks} ticks in {wall:.1} s written to {} ({})", file.display(), if ok { "ok" } else { "FAILED" });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
