@@ -873,6 +873,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if let Some(slot) = slot {
                     EI_NAMED.lock().unwrap().push((slot, hash, gfx));
                 }
+                // lab: the SAME call's record as the title wrote it, next to the bounded one
+                // ("ei pair"): the bounded record of a folded program read [0 | 174 | 1, 1, 1]
+                // where the title's records were said to ask for ~100000 groups
+                if let (Some(b), Some(_)) = (slot, &bounded) {
+                    if let Some(t) = ei_peek_slot(this, 41, max, args, args_off, count_buf, count_off) {
+                        EI_PAIRS.lock().unwrap().push((t, b, hash));
+                    }
+                }
             }
             // lab: a compute call's record as the title wrote it (before it is bounded), up to 64
             // a program: how many groups its dispatches ask for (D3D12 takes 65535 a dimension,
@@ -1240,6 +1248,9 @@ static EI_NAMED_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// lab (`XCL_EI_PEEK`): (slot, CS record hash) of compute records as the title wrote them
 static EI_WIDE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// lab: (slot of the title's record, slot of the bounded record, shader record hash) of one call
+static EI_PAIRS: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+static EI_PAIRS_DONE: AtomicU64 = AtomicU64::new(0);
 
 fn ei_peek_report() {
     let g = EI_PEEK.lock().unwrap();
@@ -1277,6 +1288,23 @@ fn ei_peek_report() {
                 wide.len(),
                 wide.iter().take(24).map(|(h, e)| format!("{h:016x} {} of {} widest {:?}", e.1, e.0, e.2)).collect::<Vec<_>>().join("; ")
             );
+        }
+        {
+            // only the pairs whose two records differ, and every pair of a folded program
+            let pairs = EI_PAIRS.lock().unwrap();
+            let from = EI_PAIRS_DONE.load(Ordering::Relaxed) as usize;
+            let mut done = from;
+            for &(t, b, hash) in pairs.iter().skip(from) {
+                if w(t, 0) == 0xEEEE_EEEE || w(b, 0) == 0xEEEE_EEEE {
+                    break;
+                }
+                done += 1;
+                let (tr, br) = ([w(t, 0), w(t, 1), w(t, 2)], [w(b, 0), w(b, 1), w(b, 2)]);
+                if tr != br || crate::gpu::dxil::kernel::fold_groups(hash) {
+                    crate::xlog_info!("ei pair: {hash:016x} at {:.1} s: the title's record {tr:?}, the bounded one {br:?}", pk.meta[t].0);
+                }
+            }
+            EI_PAIRS_DONE.store(done as u64, Ordering::Relaxed);
         }
         {
             let named = EI_NAMED.lock().unwrap();

@@ -1065,8 +1065,19 @@ unsafe fn rt_dump_take() -> Option<Vec<(usize, u8)>> {
     let done = RT_DUMPS_DONE.load(Ordering::Relaxed) as usize;
     let due = rt_dump_times().get(done).is_some_and(|&t| crate::log::uptime() >= t);
     if !due {
-        for (r, _) in set {
-            release(r);
+        // (pass snapshots stay for the dump: they are taken once, up to a second before it)
+        let mut keep = Vec::new();
+        for (r, k) in set {
+            if k == b'p' {
+                keep.push((r, k));
+            } else {
+                release(r);
+            }
+        }
+        if !keep.is_empty() {
+            let mut g = RT_DUMP_SET.lock().unwrap();
+            keep.append(&mut g);
+            *g = keep;
         }
         return None;
     }
