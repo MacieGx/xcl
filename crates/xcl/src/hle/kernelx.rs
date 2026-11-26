@@ -555,12 +555,69 @@ fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
 /// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
 /// Windows refuses it.
 unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    let (flags, protect) = (sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    let mut q = if t & MEM_64K_PAGES == MEM_64K_PAGES { reserve_in_view_windows(size, flags, protect) } else { std::ptr::null_mut() };
+    if q.is_null() {
+        q = mem::VirtualAlloc(std::ptr::null(), size, flags, protect);
+    }
     if !q.is_null() {
         GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
     q
+}
+
+/// The title's reservation of 64 KiB pages that no sparse window had room for, at the lowest
+/// free addresses of the view-memory windows (`d3d12x::view_mem`, 0x8_0000_0000..0x14_0000_0000
+/// with the unified block at 0x4_0000_0000) when it fits there; null otherwise.
+///
+/// A retail title reserves its memory of 64 KiB pages twice (a CPU view, then a GPU-only view of
+/// it, 16 GB each on Series S, 24 GB on Series X) and keeps its streamed geometry - meshlet,
+/// vertex and index buffers - at GPU-view addresses. Translated shaders reach only the 16
+/// windows from the unified block's base: view memory fills windows 4..15 on demand from the CPU
+/// view. Those reservations came from Windows at no fixed address; where Windows put them right
+/// after the windows (0x7_FFFF0000 and 0xD_FFFF0000), the geometry was reachable. In a process
+/// whose large allocations Windows places high (a sandboxed launch: 0x1b2e1580000 and
+/// 0x1b6e1580000, another run 0x20a7fc20000 / 0x20e7fc20000) every meshlet load read 0: the
+/// world's ~1,500 G-buffer draws a frame ran and wrote no texel, the depth buffer stayed clear,
+/// and only the sky was drawn; view memory filled 0 tiles. `XCL_VIEWS_LOW=0`: as before.
+unsafe fn reserve_in_view_windows(size: usize, flags: u32, protect: u32) -> *mut c_void {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_VIEWS_LOW").is_ok_and(|v| v.trim() == "0")) {
+        return std::ptr::null_mut();
+    }
+    let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
+    const WINDOW: usize = 1 << 32;
+    const ALIGN: usize = 0x1_0000;
+    let lo = u.base() + crate::hle::d3d12x::view_mem::FIRST * WINDOW;
+    let hi = u.base() + crate::hle::d3d12x::view_mem::END * WINDOW;
+    if size == 0 || size > hi - lo {
+        return std::ptr::null_mut();
+    }
+    let mut a = lo;
+    while a < hi && hi - a >= size {
+        let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if mem::VirtualQuery(a as *const c_void, &mut mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
+            break;
+        }
+        let (start, end) = (mbi.BaseAddress as usize, mbi.BaseAddress as usize + mbi.RegionSize);
+        if mbi.State == mem::MEM_FREE {
+            let at = a.max(start).next_multiple_of(ALIGN);
+            if at.checked_add(size).is_some_and(|e| e <= end.min(hi)) {
+                let q = mem::VirtualAlloc(at as *const c_void, size, flags, protect);
+                if !q.is_null() {
+                    crate::xlog_info!("kernelx: the title's {size:#x} bytes of 64 KiB pages reserved at {:#x} (in the view-memory windows {lo:#x}..{hi:#x}, where translated shaders reach them)", q as usize);
+                    return q;
+                }
+            }
+        }
+        if end <= a {
+            break;
+        }
+        a = end;
+    }
+    crate::xlog_warn!("kernelx: no room for the title's {size:#x} bytes of 64 KiB pages in the view-memory windows {lo:#x}..{hi:#x}: at an address Windows picks (translated shaders may not reach it)");
+    std::ptr::null_mut()
 }
 
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
