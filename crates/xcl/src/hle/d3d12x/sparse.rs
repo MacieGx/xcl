@@ -295,6 +295,9 @@ struct State {
     parked: FxHashMap<usize, (u32, u32)>,
     /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
     quarantined: VecDeque<RetiredTiles>,
+    /// lab (`XCL_SPARSE_COOL=1`): pool tiles a buffer gave back (`release_if_unused`), quarantined
+    /// with the parked ones at the next flush instead of free at once
+    released: Vec<(u32, u32)>,
     /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
     queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// tile address → pool tile of decommitted tiles a placed buffer uses: they stay mapped in
@@ -386,6 +389,60 @@ fn read_chunk_words(c: &[u8]) -> [u64; 8] {
 #[inline(always)]
 fn chunk_hash(c: &[u8]) -> u64 {
     hash_words(read_chunk_words(c))
+}
+
+/// lab: `XCL_READBACK_GUARD=1`: a synchronous copy back (`readback_released`) lands a 64-byte
+/// chunk only if the CPU's view of it is as it was when the copy was submitted: the copy is
+/// waited for with `STATE` released, and the title may write there meanwhile (that write is
+/// kept, and goes to video memory with the next submit, as its `sent` hash stays).
+fn readback_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_READBACK_GUARD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// lab (`readback_guard`): chunks a copy back did not land, as the CPU wrote them meanwhile
+static GUARD_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// The hashes of the 64-byte chunks that `parts` (address, offset, bytes) touch in the CPU view,
+/// in order; 0 for a chunk of a page that is not `committed`.
+unsafe fn chunk_hashes(parts: &[(usize, usize, usize)], committed: impl Fn(usize) -> bool) -> Vec<u64> {
+    let mut out = Vec::new();
+    for &(dst, _, len) in parts {
+        let mut c = dst & !(CHUNK - 1);
+        while c < dst + len {
+            out.push(if committed(c & !(PAGE - 1)) { chunk_hash(std::slice::from_raw_parts(c as *const u8, CHUNK)) } else { 0 });
+            c += CHUNK;
+        }
+    }
+    out
+}
+
+/// `parts` (address, offset at `p`, bytes) copied from `p` into the CPU view, a 64-byte chunk at
+/// a time, where the chunk's page is `committed` and the chunk still hashes as `before`
+/// (`chunk_hashes` when the copy was submitted). Returns the chunks landed (address, hash after)
+/// and the number kept as the CPU wrote them.
+unsafe fn land_unchanged(p: *const u8, parts: &[(usize, usize, usize)], before: &[u64], committed: impl Fn(usize) -> bool) -> (Vec<(usize, u64)>, usize) {
+    let (mut landed, mut kept, mut i) = (Vec::new(), 0, 0);
+    for &(dst, off, len) in parts {
+        let end = dst + len;
+        let mut c = dst & !(CHUNK - 1);
+        while c < end {
+            let was = before.get(i).copied();
+            i += 1;
+            if committed(c & !(PAGE - 1)) {
+                let view = std::slice::from_raw_parts(c as *const u8, CHUNK);
+                if was == Some(chunk_hash(view)) {
+                    let (lo, hi) = (c.max(dst), (c + CHUNK).min(end));
+                    std::ptr::copy_nonoverlapping(p.add(off + (lo - dst)), lo as *mut u8, hi - lo);
+                    landed.push((c, chunk_hash(std::slice::from_raw_parts(c as *const u8, CHUNK))));
+                } else {
+                    kept += 1;
+                }
+            }
+            c += CHUNK;
+        }
+    }
+    (landed, kept)
 }
 
 #[inline(always)]
@@ -484,6 +541,15 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// lab: `XCL_SPARSE_COOL=1`: a pool tile a buffer gives back is used again only after the work
+/// submitted before on the sparse queue and every known title queue is done (the quarantine of
+/// parked tiles, #2345), not at once. nvidia-dev's cooldown (`9554f33e`, `76969bc1`: freed tiles
+/// wait 2 s) covered every freed tile; here the parked ones have the quarantine already.
+fn sparse_cool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_COOL").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// One copy back at a time (`readback_released`): the readback buffer and its list are in use
 /// until the copy is done, and that is waited for with `STATE` released. Taken before `STATE`,
 /// never under it.
@@ -577,13 +643,18 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
                 continue;
             }
             let value = s.value;
+            // lab (`readback_guard`): the CPU's view as the copy was submitted
+            let before = readback_guard().then(|| chunk_hashes(&parts, |pg| s.page_committed(pg)));
             let (again, there) = wait_released(g, value);
             g = again;
             if !there {
                 return;
             }
             if let Some(s) = g.as_mut() {
-                s.copy_back(p, &parts);
+                match &before {
+                    Some(before) => s.copy_back_unchanged(p, &parts, before),
+                    None => s.copy_back(p, &parts),
+                }
             }
         }
     }
@@ -720,6 +791,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         parked: FxHashMap::default(),
         kept: FxHashMap::default(),
         quarantined: VecDeque::new(),
+        released: Vec::new(),
         queue_fences: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
@@ -1332,6 +1404,31 @@ impl State {
                 }
             }
             pg = tile_end;
+        }
+    }
+
+    /// Whether page `pg` is mapped here and committed (not a hole of its tile).
+    fn page_committed(&self, pg: usize) -> bool {
+        let t = pg & !(TILE - 1);
+        self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0)
+    }
+
+    /// lab (`readback_guard`): `copy_back` of the chunks the CPU did not write since `before`
+    /// (`chunk_hashes` at the submit); `sent` hashes follow the chunks landed only.
+    unsafe fn copy_back_unchanged(&mut self, p: *const u8, parts: &[(usize, usize, usize)], before: &[u64]) {
+        let (landed, kept) = land_unchanged(p, parts, before, |pg| self.page_committed(pg));
+        for (c, h) in landed {
+            let pg = c & !(PAGE - 1);
+            let t = pg & !(TILE - 1);
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.sent[(pg - t) / PAGE].get_or_insert_with(|| Box::new(ZERO_HASHES))[(c - pg) / CHUNK] = h;
+            }
+        }
+        if kept > 0 {
+            let n = GUARD_KEPT.fetch_add(kept as u64, Ordering::Relaxed) + kept as u64;
+            if n == kept as u64 || (n - kept as u64).leading_zeros() != n.leading_zeros() {
+                crate::xlog_info!("sparse: a copy back kept {kept} chunks the CPU wrote while it ran ({n} so far; XCL_READBACK_GUARD=1)");
+            }
         }
     }
 
@@ -2045,7 +2142,13 @@ impl State {
 
     /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
     /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    /// lab: with `XCL_SPARSE_COOL=1` it is quarantined at the next flush (`released`) instead.
     fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
+        self.release_if_unused_as(t, tile, sparse_cool());
+    }
+
+    /// `release_if_unused`, quarantined at the next flush if `cool` (`XCL_SPARSE_COOL`).
+    fn release_if_unused_as(&mut self, t: usize, tile: (u32, u32), cool: bool) {
         if self.pinned.contains_key(&tile) {
             return;
         }
@@ -2055,7 +2158,11 @@ impl State {
             return;
         }
         if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) && !self.quarantined.iter().any(|b| b.tiles.contains(&tile)) {
-            self.free.push(tile);
+            if !cool {
+                self.free.push(tile);
+            } else if !self.released.contains(&tile) {
+                self.released.push(tile);
+            }
         }
     }
 
@@ -2137,10 +2244,15 @@ impl State {
     /// they take a tile right away.
     unsafe fn flush_parked(&mut self) -> bool {
         if self.parked.is_empty() {
+            // lab (`XCL_SPARSE_COOL=1`): tiles buffers gave back, behind the same fences
+            if !self.released.is_empty() {
+                let tiles = std::mem::take(&mut self.released);
+                self.quarantine_tiles(tiles);
+            }
             return false;
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-        let mut tiles: Vec<(u32, u32)> = Vec::new();
+        let mut tiles: Vec<(u32, u32)> = std::mem::take(&mut self.released);
         for (t, tile) in std::mem::take(&mut self.parked) {
             // (a placed buffer uses it)
             if self.pinned.contains_key(&tile) {
@@ -2596,6 +2708,46 @@ fn forget_in(s: &mut State, res: usize) {
 }
 
 #[cfg(test)]
+mod readback_guard_tests {
+    use super::*;
+
+    /// lab (`XCL_READBACK_GUARD=1`): a copy back lands the chunks the CPU did not write while it
+    /// ran, and keeps the one it wrote; a part that starts and ends inside a chunk copies only its
+    /// own bytes.
+    #[test]
+    fn a_copy_back_keeps_a_chunk_the_cpu_wrote_meanwhile() {
+        unsafe {
+            // a page-aligned "CPU view" of 4 chunks, and what video memory holds
+            let mut page = vec![0u8; 2 * PAGE];
+            let base = (page.as_mut_ptr() as usize + PAGE - 1) & !(PAGE - 1);
+            let view = std::slice::from_raw_parts_mut(base as *mut u8, 4 * CHUNK);
+            view.fill(1);
+            let gpu = vec![9u8; 4 * CHUNK];
+            // bytes 10 .. 4 chunks - 10: the first and last chunks only in part
+            let parts = [(base + 10, 10usize, 4 * CHUNK - 20)];
+            let all = |_: usize| true;
+            let before = chunk_hashes(&parts, all);
+            assert_eq!(before.len(), 4);
+            // the CPU writes chunk 2 while the copy runs
+            view[2 * CHUNK + 5] = 7;
+            let (landed, kept) = land_unchanged(gpu.as_ptr(), &parts, &before, all);
+            assert_eq!(kept, 1);
+            assert_eq!(landed.iter().map(|l| (l.0 - base) / CHUNK).collect::<Vec<_>>(), vec![0, 1, 3]);
+            assert_eq!(&view[..10], &[1u8; 10], "before the part: as it was");
+            assert!(view[10..2 * CHUNK].iter().all(|&b| b == 9));
+            assert_eq!(view[2 * CHUNK + 5], 7, "the CPU's write is kept");
+            assert_eq!(view[2 * CHUNK], 1);
+            assert!(view[3 * CHUNK..4 * CHUNK - 10].iter().all(|&b| b == 9));
+            assert_eq!(&view[4 * CHUNK - 10..], &[1u8; 10], "after the part: as it was");
+            assert_eq!(landed[0].1, chunk_hash(&view[..CHUNK]), "the hash after the landing");
+            // a page that is not committed is neither read nor written
+            let (landed, kept) = land_unchanged(gpu.as_ptr(), &parts, &chunk_hashes(&parts, |_| false), |_| false);
+            assert!(landed.is_empty() && kept == 0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2687,6 +2839,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2871,6 +3024,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3086,6 +3240,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3193,6 +3348,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                released: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -3356,6 +3512,52 @@ mod tests {
             s.wait_for(s.value);
             assert!(s.drain_quarantined(), "completed unmap batch should drain after fence completion");
             assert!(s.free.contains(&tile), "unmapped tile must return to free list once unmap fence completes");
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// lab (`XCL_SPARSE_COOL=1`): a pool tile a buffer gives back is not free at once: it is
+    /// quarantined at the next flush, behind the work submitted before, as parked tiles are.
+    #[test]
+    fn a_tile_a_buffer_gives_back_is_quarantined_with_the_cool_switch() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            // a tile only a buffer used (its window maps another one at the address)
+            let tile = s.mapped[&base].pool;
+            let other = (tile.0, tile.1 + 1);
+            s.free.retain(|&t| t != other);
+            s.release_if_unused_as(base, other, false);
+            assert!(s.free.contains(&other), "without the switch: free at once");
+            s.free.retain(|&t| t != other);
+
+            // a title queue whose work submitted before is still running
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            assert!(s.note_queue(&title_q));
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            title_q.Wait(&gate, 1).expect("gate title queue");
+            s.release_if_unused_as(base, other, true);
+            s.release_if_unused_as(base, other, true);
+            assert_eq!(s.released, vec![other], "once");
+            assert!(!s.free.contains(&other));
+            assert!(!s.flush_parked(), "nothing parked to unmap");
+            assert!(s.released.is_empty());
+            assert!(!s.drain_quarantined(), "the title queue is held: still quarantined");
+            assert!(!s.free.contains(&other));
+            gate.Signal(1).expect("release title queue");
+            let t0 = std::time::Instant::now();
+            while !s.drain_quarantined() {
+                assert!(t0.elapsed().as_secs() < 5, "the title queue went on");
+                std::thread::yield_now();
+            }
+            assert!(s.free.contains(&other), "free once the work before is done");
             drop(_unblock);
             s.wait_for(s.value);
             drop(s);

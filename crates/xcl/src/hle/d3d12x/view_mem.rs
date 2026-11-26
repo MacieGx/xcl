@@ -28,6 +28,9 @@ pub const FIRST: usize = 4;
 pub const END: usize = 16;
 const POOL_TILES: u32 = 1024;
 const STAGING_TILES: usize = 128;
+/// lab (`XCL_VIEW_NO_WAIT=1`): upload batches in flight at once, each with its own list and
+/// `STAGING_TILES` of the staging buffer
+const RING: usize = 4;
 
 struct Tile {
     sig: u64,
@@ -58,8 +61,64 @@ struct State {
     cap_tiles: usize,
     /// (va, len) → when it was last looked at
     recent: HashMap<(usize, usize), std::time::Instant>,
+    /// lab (`no_wait`): the upload batches' lists and staging parts, used in turn
+    ring: Vec<RingSlot>,
+    ring_next: usize,
 }
 unsafe impl Send for State {}
+
+/// lab (`no_wait`): a batch's list, reused once the fence passed `value`; it copies from
+/// staging part (its index × `STAGING_TILES` tiles).
+struct RingSlot {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    value: u64,
+}
+
+/// lab: `XCL_VIEW_NO_WAIT=1`: an upload is not waited for on the CPU, with the state's lock held,
+/// before `ensure` returns: the title's queue waits for it on the GPU before the submit
+/// (`before_execute`), and the staging is a ring whose parts are reused by fence value.
+fn no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_VIEW_NO_WAIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// lab (`no_wait`): the fence the uploads signal, and the last value signalled, for the title's
+/// queues to wait for without the state's lock (`before_execute`)
+static UPLOAD_FENCE: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
+static UPLOAD_LAST: AtomicU64 = AtomicU64::new(0);
+/// lab: queue waits added for uploads, and batches that waited for a ring part on the CPU
+static QUEUE_WAITS: AtomicU64 = AtomicU64::new(0);
+static RING_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// The value a title queue has to wait for before its submit (`before_execute`): the last
+/// upload's, when the fence has not passed it yet (None: nothing to wait for).
+fn upload_wait(last: u64, completed: u64) -> Option<u64> {
+    (last != 0 && completed < last).then_some(last)
+}
+
+/// The value a ring part has to be waited for at before its reuse (None: free now).
+fn ring_wait(slot_value: u64, completed: u64) -> Option<u64> {
+    (slot_value != 0 && completed < slot_value).then_some(slot_value)
+}
+
+/// lab (`XCL_VIEW_NO_WAIT=1`): before the title's ExecuteCommandLists on `queue`: it waits on the
+/// GPU for the view memory uploads recorded so far (its lists may read them). Without the lock.
+pub unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+    if !no_wait() {
+        return;
+    }
+    let last = UPLOAD_LAST.load(Ordering::Acquire);
+    if last == 0 {
+        return;
+    }
+    let Some(fence) = UPLOAD_FENCE.lock().unwrap().clone() else { return };
+    if let Some(v) = upload_wait(last, super::real::fence_completed(&fence)) {
+        if queue.Wait(&fence, v).is_ok() {
+            QUEUE_WAITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
@@ -109,10 +168,20 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
         list.Close()?;
         let mut staging: Option<ID3D12Resource> = None;
+        let parts = if no_wait() { RING } else { 1 };
+        let mut ring = Vec::new();
+        if no_wait() {
+            for _ in 0..RING {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+                list.Close()?;
+                ring.push(RingSlot { alloc, list, value: 0 });
+            }
+        }
         dev.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
             D3D12_HEAP_FLAG_NONE,
-            &buffer_desc((STAGING_TILES * TILE) as u64, D3D12_RESOURCE_FLAG_NONE),
+            &buffer_desc((parts * STAGING_TILES * TILE) as u64, D3D12_RESOURCE_FLAG_NONE),
             D3D12_RESOURCE_STATE_GENERIC_READ,
             None,
             &mut staging,
@@ -139,12 +208,18 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
             staging_at: p as *mut u8,
             cap_tiles: cap_mb << 4,
             recent: HashMap::new(),
+            ring,
+            ring_next: 0,
         })
     })();
     match made {
         Ok(s) => {
             let out = s.windows.iter().map(|w| (w.as_raw() as usize, WINDOW)).collect();
             crate::xlog_info!("D3D12.X: view memory: windows {FIRST}..{END} ({:#x}..{:#x}) are filled on demand, up to {} MB", base + FIRST * WINDOW, base + END * WINDOW, s.cap_tiles >> 4);
+            if no_wait() {
+                *UPLOAD_FENCE.lock().unwrap() = Some(s.fence.clone());
+                crate::xlog_info!("D3D12.X: view memory: uploads are not waited for under the lock; the title's queues wait for them (XCL_VIEW_NO_WAIT=1, {RING} batches in flight)");
+            }
             *STATE.lock().unwrap() = Some(s);
             out
         }
@@ -389,22 +464,39 @@ pub unsafe fn ensure(va: usize, len: usize) {
     }
     super::real::removed_probe("view_mem::ensure: after the tile mappings");
     for batch in todo.chunks(STAGING_TILES) {
-        if s.alloc.Reset().is_err() || s.list.Reset(&s.alloc, None).is_err() {
-            return;
-        }
+        // lab (`no_wait`): the next ring part, once the GPU is done with its last batch
+        let (list, part) = if no_wait() {
+            let i = s.ring_next;
+            s.ring_next = (i + 1) % RING;
+            if let Some(v) = ring_wait(s.ring[i].value, super::real::fence_completed(&s.fence)) {
+                RING_WAITS.fetch_add(1, Ordering::Relaxed);
+                let _ = crate::gpu::fence::wait(&s.fence, v, &s.dev, None, 5000);
+            }
+            let r = &s.ring[i];
+            if r.alloc.Reset().is_err() || r.list.Reset(&r.alloc, None).is_err() {
+                return;
+            }
+            (r.list.clone(), i * STAGING_TILES)
+        } else {
+            if s.alloc.Reset().is_err() || s.list.Reset(&s.alloc, None).is_err() {
+                return;
+            }
+            (s.list.clone(), 0)
+        };
         for (i, &(tile, src, _)) in batch.iter().enumerate() {
             if !s.tiles.contains_key(&tile) {
                 continue;
             }
-            std::ptr::write_bytes(s.staging_at.add(i * TILE), 0, TILE);
-            super::title_textures::copy_committed_region(src, s.staging_at.add(i * TILE), TILE);
+            let at = (part + i) * TILE;
+            std::ptr::write_bytes(s.staging_at.add(at), 0, TILE);
+            super::title_textures::copy_committed_region(src, s.staging_at.add(at), TILE);
             let k = (tile - s.base) / WINDOW - FIRST;
-            s.list.CopyBufferRegion(&s.windows[k], ((tile - s.base) % WINDOW) as u64, &s.staging, (i * TILE) as u64, TILE as u64);
+            list.CopyBufferRegion(&s.windows[k], ((tile - s.base) % WINDOW) as u64, &s.staging, at as u64, TILE as u64);
         }
-        if s.list.Close().is_err() {
+        if list.Close().is_err() {
             return;
         }
-        let Ok(cl) = s.list.cast::<ID3D12CommandList>() else { return };
+        let Ok(cl) = list.cast::<ID3D12CommandList>() else { return };
         let was_removed = s.dev.GetDeviceRemovedReason().is_err();
         s.queue.ExecuteCommandLists(&[Some(cl)]);
         if !was_removed && s.dev.GetDeviceRemovedReason().is_err() {
@@ -415,6 +507,12 @@ pub unsafe fn ensure(va: usize, len: usize) {
         s.value += 1;
         if s.queue.Signal(&s.fence, s.value).is_err() {
             return;
+        }
+        if no_wait() {
+            s.ring[part / STAGING_TILES].value = s.value;
+            UPLOAD_LAST.store(s.value, Ordering::Release);
+            UPLOADED.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            continue;
         }
         if let Err(e) = crate::gpu::fence::wait(&s.fence, s.value, &s.dev, None, 5000) {
             static N: AtomicU64 = AtomicU64::new(0);
@@ -481,11 +579,29 @@ pub unsafe fn ensure_for_draw(layout: Option<&super::console_list::Layout>, args
 pub fn stats() -> String {
     let (tiles, pools) = (TILES.load(Ordering::Relaxed), POOLS.load(Ordering::Relaxed));
     format!(
-        "view memory: {} MB in {tiles} tiles ({pools} pools), {} given back, {} tile uploads, {} tile checks, {} without a source",
+        "view memory: {} MB in {tiles} tiles ({pools} pools), {} given back, {} tile uploads, {} tile checks, {} without a source{}",
         tiles >> 4,
         EVICTED.load(Ordering::Relaxed),
         UPLOADED.load(Ordering::Relaxed),
         CHECKED.load(Ordering::Relaxed),
-        NO_SOURCE.load(Ordering::Relaxed)
+        NO_SOURCE.load(Ordering::Relaxed),
+        if no_wait() { format!("; no-wait: {} queue waits, {} ring waits", QUEUE_WAITS.load(Ordering::Relaxed), RING_WAITS.load(Ordering::Relaxed)) } else { String::new() }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// lab (`XCL_VIEW_NO_WAIT=1`): a title queue waits for the last upload only while the fence
+    /// has not passed it; a ring part is reused at once when its batch is done.
+    #[test]
+    fn uploads_are_waited_for_on_the_gpu_only_while_in_flight() {
+        assert_eq!(upload_wait(0, 0), None, "no upload yet");
+        assert_eq!(upload_wait(7, 6), Some(7));
+        assert_eq!(upload_wait(7, 7), None, "done");
+        assert_eq!(ring_wait(0, 0), None, "never used");
+        assert_eq!(ring_wait(5, 4), Some(5));
+        assert_eq!(ring_wait(5, 9), None);
+    }
 }

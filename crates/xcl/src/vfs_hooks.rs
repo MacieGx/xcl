@@ -533,6 +533,8 @@ unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32,
     let orig = orig!(O_READ_FILE as F);
     if !buf.is_null() {
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+        // lab: and a block guarded for the hot looks is given back (`d3d12x::write_guard`)
+        crate::hle::d3d12x::write_guard::unguard(buf as usize, n as usize);
     }
     orig(h, buf, n, read, ov)
 }
