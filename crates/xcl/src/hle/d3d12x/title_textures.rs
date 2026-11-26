@@ -1354,6 +1354,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     });
     let took = look.then(|| (watch_t0.elapsed(), dirty_len));
     if look {
+        super::submit_cost::looked();
         super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
     }
     if super::present::trace_frame() {
@@ -1402,6 +1403,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let t_filter = std::time::Instant::now();
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -1444,7 +1446,10 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     }
     super::vram::touch(todo.iter().map(|(r, _)| r.as_raw() as usize));
     seed_stream_recheck(&todo, &ranges, recheck_frame);
+    super::submit_cost::filter(t_filter.elapsed());
+    let t_textures = std::time::Instant::now();
     upload_all(todo);
+    super::submit_cost::textures(t_textures.elapsed());
     took
 }
 
