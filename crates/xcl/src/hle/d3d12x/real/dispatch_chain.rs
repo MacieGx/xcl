@@ -13,12 +13,45 @@ static SLABS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
+/// dispatches of a split program run whole instead of chained (`XCL_CHAIN_WHOLE`)
+static WHOLE_RUNS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); {} dispatches run whole (XCL_CHAIN_WHOLE)",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
-        mib(&LIVE), mib(&PEAK), mib(&WANTED));
+        mib(&LIVE), mib(&PEAK), mib(&WANTED), WHOLE_RUNS.load(Ordering::Relaxed));
+}
+
+/// lab: `XCL_CHAIN_WHOLE=1` (every split program) or `=<cs record hash>,...` (the console CS hashes
+/// the GPU profile names): a Dispatch of a split compute program runs its whole form, once that
+/// is built, instead of its pieces. A chain records a dispatch and a UAV barrier for each piece
+/// of each slab, and ped skinning runs ~1,300 chains of 7 pieces over 5 - 17 groups a frame: the
+/// barriers and the tiny dispatches, more than the shader, are its GPU time. The whole form is
+/// the one an ExecuteIndirect of the program runs; it is built once, in the background (from the
+/// driver's blob of an earlier run when there is one), and the pieces run until it is there.
+fn whole_for(spec: Option<&str>, record: u64) -> bool {
+    match spec.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(list) => list.split(',').any(|h| u64::from_str_radix(h.trim(), 16).ok() == Some(record)),
+    }
+}
+
+fn whole_wanted(record: u64) -> bool {
+    static SPEC: OnceLock<Option<String>> = OnceLock::new();
+    whole_for(SPEC.get_or_init(|| std::env::var("XCL_CHAIN_WHOLE").ok()).as_deref(), record)
+}
+
+/// `ready`, else nothing, starting its build (`start`) the first time it is missing.
+fn ready_or_start<P: Clone>(ready: Option<&P>, started: &AtomicBool, start: impl FnOnce()) -> Option<P> {
+    if let Some(p) = ready {
+        return Some(p.clone());
+    }
+    if !started.swap(true, Ordering::AcqRel) {
+        start();
+    }
+    None
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -55,9 +88,31 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    /// the background build of `whole` has begun (`XCL_CHAIN_WHOLE`)
+    whole_started: AtomicBool,
 }
 
 impl Chain {
+    /// The whole form for a Dispatch (`XCL_CHAIN_WHOLE`): the one built already, else none while
+    /// a thread builds it (once: after a failed build the program stays on its pieces).
+    fn whole_in_background(self: &Arc<Self>) -> Option<ID3D12PipelineState> {
+        // one build at a time: a world's first dispatches would start a hundred driver compiles at once
+        static ONE: Mutex<()> = Mutex::new(());
+        ready_or_start(self.whole.get(), &self.whole_started, || {
+            let chain = self.clone();
+            // (an `xcl-pso` thread: a huge build waits its turn at the driver like the workers')
+            let spawned = std::thread::Builder::new().name("xcl-pso-chain-whole".into()).spawn(move || {
+                let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = unsafe { chain.whole() } {
+                    crate::xlog_warn!("D3D12.X: XCL_CHAIN_WHOLE: the whole form of CS {:016x} was not built ({e}); its dispatches stay chained", chain.builder.record);
+                }
+            });
+            if let Err(e) = spawned {
+                crate::xlog_warn!("D3D12.X: XCL_CHAIN_WHOLE: no thread for a whole build ({e})");
+            }
+        })
+    }
+
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let _guard = self.build_whole.lock().unwrap();
@@ -91,7 +146,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), whole_started: AtomicBool::new(false) });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -208,6 +263,14 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
     if grid.contains(&0) { return Ok(()); }
+    if whole_wanted(chain.builder.record) {
+        if let Some(whole) = chain.whole_in_background() {
+            WHOLE_RUNS.fetch_add(1, Ordering::Relaxed);
+            list.SetPipelineState(&whole);
+            list.Dispatch(x, y, z);
+            return Ok(());
+        }
+    }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
     let allocator = if super::super::alloc_pool::enabled() {
@@ -236,9 +299,36 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::{ready_or_start, scratch_bytes, whole_for, LEAST};
+    use std::sync::atomic::AtomicBool;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn chain_whole_names_every_program_or_the_listed_ones() {
+        let record = 0x44ca_55bf_efe6_7bd5;
+        for off in [None, Some(""), Some("0"), Some("bd968d88fabf544f"), Some("not a hash")] {
+            assert!(!whole_for(off, record), "{off:?}");
+        }
+        for on in [Some("1"), Some(" 1 "), Some("44ca55bfefe67bd5"), Some("bd968d88fabf544f, 44CA55BFEFE67BD5 ,")] {
+            assert!(whole_for(on, record), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_whole_form_is_built_once_and_runs_when_ready() {
+        let started = AtomicBool::new(false);
+        let mut builds = 0;
+        assert_eq!(ready_or_start::<u32>(None, &started, || builds += 1), None, "the pieces run while it builds");
+        assert_eq!(ready_or_start::<u32>(None, &started, || builds += 1), None);
+        assert_eq!(builds, 1, "one build however many dispatches wait for it");
+        assert_eq!(ready_or_start(Some(&7u32), &started, || builds += 1), Some(7));
+        assert_eq!(builds, 1);
+        // built before any dispatch asked (an ExecuteIndirect built it): no build is started
+        let fresh = AtomicBool::new(false);
+        assert_eq!(ready_or_start(Some(&3u32), &fresh, || builds += 1), Some(3));
+        assert_eq!(builds, 1);
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
